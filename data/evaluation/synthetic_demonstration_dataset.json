@@ -1,0 +1,97 @@
+{
+  "metadata": {
+    "dataset_name": "ReRAG Synthetic Demonstration Dataset",
+    "version": "1.0.0",
+    "is_demonstration_dataset": true,
+    "disclaimer": "DEMONSTRATION DATASET ONLY - NOT A VALIDATED RESEARCH BENCHMARK. Designed solely for unit testing and verifying evaluation metrics pipeline functionality.",
+    "format_documentation": {
+      "sample_id": "Unique string identifier for the evaluation test case",
+      "question": "Evaluation prompt or user inquiry string",
+      "reference_answer": "Ground-truth factual answer written by human annotators",
+      "expected_source": "Optional document ID string where supporting evidence resides",
+      "expected_pages": "Optional list of 1-indexed page numbers where facts are located",
+      "document_id": "Document identifier in vector store collection",
+      "relevant_doc_ids": "Optional list of document IDs containing ground-truth evidence",
+      "supporting_passages": "Optional list of raw verbatim passages containing evidence",
+      "metadata": "Optional arbitrary key-value metadata dictionary (category, difficulty, etc.)"
+    }
+  },
+  "samples": [
+    {
+      "sample_id": "synth_01_rerag_purpose",
+      "question": "What is the primary architectural purpose of ReRAG?",
+      "reference_answer": "ReRAG is an architecture designed for reducing factual hallucinations in retrieval-augmented generation.",
+      "expected_source": "paper_rerag",
+      "expected_pages": [1],
+      "document_id": "paper_rerag",
+      "relevant_doc_ids": ["paper_rerag"],
+      "supporting_passages": [
+        "ReRAG is an architecture designed for reducing factual hallucinations in retrieval-augmented generation."
+      ],
+      "metadata": {"topic": "RAG", "difficulty": "easy"}
+    },
+    {
+      "sample_id": "synth_02_verification_threshold",
+      "question": "What threshold does the ReRAG verification step use to check candidate claims?",
+      "reference_answer": "The verification step checks candidate claims against retrieved context passages using a consistency threshold of 0.7.",
+      "expected_source": "paper_rerag",
+      "expected_pages": [2],
+      "document_id": "paper_rerag",
+      "relevant_doc_ids": ["paper_rerag"],
+      "supporting_passages": [
+        "The verification step checks candidate claims against retrieved context passages using a consistency threshold of 0.7."
+      ],
+      "metadata": {"topic": "Verification", "difficulty": "medium"}
+    },
+    {
+      "sample_id": "synth_03_jwst_infrared",
+      "question": "What wavelengths does the James Webb Space Telescope observe to detect early cosmic structures?",
+      "reference_answer": "The James Webb Space Telescope observes infrared wavelengths to detect early cosmic structures.",
+      "expected_source": "paper_astronomy",
+      "expected_pages": [5],
+      "document_id": "paper_astronomy",
+      "relevant_doc_ids": ["paper_astronomy"],
+      "supporting_passages": [
+        "The James Webb Space Telescope observes infrared wavelengths to detect early cosmic structures."
+      ],
+      "metadata": {"topic": "Astronomy", "difficulty": "easy"}
+    },
+    {
+      "sample_id": "synth_04_biology_photosynthesis",
+      "question": "Where does photosynthesis take place and what conversion occurs?",
+      "reference_answer": "Photosynthesis takes place inside chloroplasts and converts solar light energy into chemical energy stored in glucose.",
+      "expected_source": "paper_biology",
+      "expected_pages": [1, 2],
+      "document_id": "paper_biology",
+      "relevant_doc_ids": ["paper_biology"],
+      "supporting_passages": [
+        "Photosynthesis takes place inside chloroplasts and converts solar light energy into chemical energy stored in glucose."
+      ],
+      "metadata": {"topic": "Biology", "difficulty": "medium"}
+    },
+    {
+      "sample_id": "synth_05_insufficient_evidence",
+      "question": "What is the exact atmospheric pressure on the surface of Venus according to the ReRAG paper?",
+      "reference_answer": "The provided context does not contain sufficient information to answer this question.",
+      "expected_source": "paper_rerag",
+      "expected_pages": [],
+      "document_id": "paper_rerag",
+      "relevant_doc_ids": [],
+      "supporting_passages": [],
+      "metadata": {"topic": "Adversarial/Insufficient", "difficulty": "hard", "is_abstention_case": true}
+    },
+    {
+      "sample_id": "synth_06_hyperparameter_optimization",
+      "question": "What hyperparameters are optimized to improve passage retrieval density?",
+      "reference_answer": "Chunk size and chunk overlap are the primary hyperparameters adjusted during grid search optimization.",
+      "expected_source": "paper_rerag",
+      "expected_pages": [4],
+      "document_id": "paper_rerag",
+      "relevant_doc_ids": ["paper_rerag"],
+      "supporting_passages": [
+        "Chunk size and chunk overlap are the primary hyperparameters adjusted during grid search optimization."
+      ],
+      "metadata": {"topic": "Optimization", "difficulty": "medium"}
+    }
+  ]
+}
