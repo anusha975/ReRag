@@ -6,10 +6,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.document_loader import LoadedDocument, PageContent
 from src.evaluator import (
     EvaluationReport,
     EvaluationSample,
     Evaluator,
+    compute_statistical_significance,
+    expand_dataset_from_document,
     load_dataset,
     split_train_test,
 )
@@ -189,4 +192,45 @@ def test_evaluator_report_save_to_file(tmp_path: Path):
     content = json.loads(save_path.read_text(encoding="utf-8"))
     assert content["total_samples"] == 1
     assert content["aggregate_metrics"]["mean_semantic_similarity"] == 0.95
+
+
+def test_expand_dataset_from_document():
+    """Verify synthetic benchmark dataset expansion from document pages."""
+    p1 = PageContent(
+        page_number=1,
+        text="The Riverbend Community Energy Pilot was launched in March 2024. Its purpose is to test shared rooftop solar installations.",
+        char_count=120,
+    )
+    doc = LoadedDocument(
+        content="The Riverbend Community Energy Pilot was launched in March 2024.",
+        metadata={"document_id": "riverbend_doc"},
+        source_path=Path("riverbend.txt"),
+        pages=[p1],
+    )
+
+    expanded = expand_dataset_from_document(document=doc, max_samples=5)
+    assert len(expanded) >= 1
+    sample = expanded[0]
+    assert isinstance(sample, EvaluationSample)
+    assert sample.expected_source == "riverbend_doc"
+    assert sample.expected_pages == [1]
+    assert len(sample.question) > 10
+    assert len(sample.reference_answer) > 10
+
+
+def test_compute_statistical_significance():
+    """Verify paired t-stat, p-value, and confidence intervals computation."""
+    baseline = [0.60, 0.65, 0.70, 0.55, 0.60]
+    rerag = [0.85, 0.90, 0.88, 0.80, 0.85]
+
+    stats = compute_statistical_significance(baseline_scores=baseline, rerag_scores=rerag)
+
+    assert stats["status"] == "computed"
+    assert stats["sample_size"] == 5
+    assert stats["mean_improvement"] > 0.20
+    assert stats["t_statistic"] > 5.0
+    assert stats["p_value_approx"] < 0.05
+    assert stats["is_statistically_significant_p05"] is True
+    assert stats["ci_95_lower"] > 0
+
 

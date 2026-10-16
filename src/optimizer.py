@@ -21,6 +21,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import random
 import time
 from dataclasses import asdict, dataclass, field
@@ -412,6 +413,7 @@ class AdaptiveChunkOptimizer:
         optimization_samples: Optional[Sequence[EvaluationSample]] = None,
         collection_name: Optional[str] = None,
         dataset_id: str = "synthetic_demonstration_dataset",
+        evaluation_cache: Optional[Dict[Tuple[int, int], Tuple[Dict[str, Any], float]]] = None,
     ) -> None:
         """Initialize optimizer.
 
@@ -429,6 +431,7 @@ class AdaptiveChunkOptimizer:
             optimization_samples: Training evaluation question set.
             collection_name: Optional collection name for ChromaDB.
             dataset_id: Dataset identifier for audit tracing.
+            evaluation_cache: Optional shared cache mapping (chunk_size, chunk_overlap) to (metrics, score).
         """
         self.search_config = search_config or AdaptiveSearchConfig()
         self.baseline_config = baseline_config or ChunkConfig(
@@ -437,6 +440,7 @@ class AdaptiveChunkOptimizer:
         )
         self.dataset_id = dataset_id
         self.collection_name = collection_name or "rerag_opt_collection"
+        self.evaluation_cache = evaluation_cache
 
         # Evaluation mechanism
         if evaluate_fn is not None:
@@ -500,6 +504,11 @@ class AdaptiveChunkOptimizer:
             Tuple[Dict[str, Any], Optional[float], Optional[str]]:
                 (metrics_dict, objective_score, error_message_if_any)
         """
+        cache_key = (config.chunk_size, config.chunk_overlap)
+        if self.evaluation_cache is not None and cache_key in self.evaluation_cache:
+            cached_metrics, cached_score = self.evaluation_cache[cache_key]
+            return cached_metrics, cached_score, None
+
         try:
             eval_output = self._evaluate_fn(config)
             if isinstance(eval_output, EvaluationReport):
@@ -513,6 +522,9 @@ class AdaptiveChunkOptimizer:
                 metrics = {"objective_score": score}
             else:
                 raise TypeError(f"Unsupported evaluation output type: {type(eval_output)}")
+
+            if self.evaluation_cache is not None:
+                self.evaluation_cache[cache_key] = (metrics, score)
 
             return metrics, score, None
         except Exception as e:
@@ -1142,6 +1154,772 @@ class AdaptiveChunkOptimizer:
         )
 
 
+# ==============================================================================
+# SIMULATED ANNEALING HYPERPARAMETER OPTIMIZATION
+# ==============================================================================
+
+
+@dataclass
+class SimulatedAnnealingConfig:
+    """Hyperparameters governing simulated annealing metaheuristic optimization."""
+
+    initial_temperature: float = 1.0
+    min_temperature: float = 0.05
+    cooling_rate: float = 0.80  # T_{k+1} = T_k * cooling_rate
+    steps_per_temperature: int = 2
+    max_trials: int = 25
+    chunk_step: int = 100
+    overlap_step: int = 25
+    bounds: SearchBounds = field(default_factory=SearchBounds)
+    objective: OptimizationObjective = field(default_factory=OptimizationObjective)
+    random_seed: int = 42
+
+
+class SimulatedAnnealingOptimizer:
+    """Metaheuristic Simulated Annealing optimizer for RAG chunking hyperparameters.
+
+    Implements probabilistic exploration with Boltzmann/Metropolis acceptance:
+        P(accept) = 1.0 if Delta E >= 0 else exp(Delta E / T)
+    where Delta E = score(candidate) - score(current).
+
+    This directly resolves the limitation noted in the ReRAG paper by enabling the
+    optimizer to escape local optima in the non-convex chunk size / overlap landscape.
+    """
+
+    def __init__(
+        self,
+        baseline_config: Optional[ChunkConfig] = None,
+        sa_config: Optional[SimulatedAnnealingConfig] = None,
+        evaluate_fn: Optional[Callable[[ChunkConfig], Union[EvaluationReport, Dict[str, Any], float]]] = None,
+        documents: Optional[Sequence[LoadedDocument]] = None,
+        pipeline: Optional[RAGPipeline] = None,
+        evaluator: Optional[Evaluator] = None,
+        optimization_samples: Optional[Sequence[EvaluationSample]] = None,
+        collection_name: Optional[str] = None,
+        dataset_id: str = "synthetic_demonstration_dataset",
+        evaluation_cache: Optional[Dict[Tuple[int, int], Tuple[Dict[str, Any], float]]] = None,
+    ) -> None:
+        """Initialize simulated annealing optimizer.
+
+        Args:
+            baseline_config: Starting chunk configuration.
+            sa_config: Simulated annealing settings.
+            evaluate_fn: Optional custom evaluation callable.
+            documents: Sequence of LoadedDocument objects to chunk and index.
+            pipeline: Active RAGPipeline.
+            evaluator: Evaluator instance.
+            optimization_samples: Training evaluation question set.
+            collection_name: Optional ChromaDB collection name.
+            dataset_id: Dataset identifier for audit tracing.
+            evaluation_cache: Optional shared cache mapping (chunk_size, chunk_overlap) to (metrics, score).
+        """
+        self.sa_config = sa_config or SimulatedAnnealingConfig()
+        self.baseline_config = baseline_config or ChunkConfig(500, 50)
+        self.dataset_id = dataset_id
+        self.collection_name = collection_name or "rerag_sa_collection"
+        self.evaluation_cache = evaluation_cache
+
+        if evaluate_fn is not None:
+            self._evaluate_fn = evaluate_fn
+        elif documents is not None and pipeline is not None and evaluator is not None and optimization_samples is not None:
+            self._evaluate_fn = self._create_pipeline_evaluator(
+                documents=documents,
+                pipeline=pipeline,
+                evaluator=evaluator,
+                samples=optimization_samples,
+                collection_name=self.collection_name,
+            )
+        else:
+            raise ValueError(
+                "SimulatedAnnealingOptimizer requires either `evaluate_fn` or "
+                "(`documents`, `pipeline`, `evaluator`, `optimization_samples`)."
+            )
+
+        random.seed(self.sa_config.random_seed)
+
+    def _create_pipeline_evaluator(
+        self,
+        documents: Sequence[LoadedDocument],
+        pipeline: RAGPipeline,
+        evaluator: Evaluator,
+        samples: Sequence[EvaluationSample],
+        collection_name: str,
+    ) -> Callable[[ChunkConfig], EvaluationReport]:
+        """Create evaluation function that rebuilds index and evaluates pipeline."""
+        def _eval_config(config: ChunkConfig) -> EvaluationReport:
+            chunker = TextChunker(
+                chunk_size=config.chunk_size,
+                chunk_overlap=config.chunk_overlap,
+            )
+            pipeline.index_documents(
+                documents=documents,
+                chunker=chunker,
+                collection_name=collection_name,
+            )
+            return evaluator.evaluate(
+                samples=samples,
+                deterministic=True,
+                config_override=config.to_dict(),
+                collection_name=collection_name,
+            )
+
+        return _eval_config
+
+    def _run_single_evaluation(
+        self,
+        config: ChunkConfig,
+    ) -> Tuple[Dict[str, Any], Optional[float], Optional[str]]:
+        """Safely execute evaluation callable for a single configuration."""
+        cache_key = (config.chunk_size, config.chunk_overlap)
+        if self.evaluation_cache is not None and cache_key in self.evaluation_cache:
+            cached_metrics, cached_score = self.evaluation_cache[cache_key]
+            return cached_metrics, cached_score, None
+
+        try:
+            eval_output = self._evaluate_fn(config)
+            if isinstance(eval_output, EvaluationReport):
+                metrics = eval_output.aggregate_metrics
+                score = self.sa_config.objective.calculate_score(metrics)
+            elif isinstance(eval_output, dict):
+                metrics = eval_output
+                score = self.sa_config.objective.calculate_score(metrics)
+            elif isinstance(eval_output, (int, float)):
+                score = round(float(eval_output), 4)
+                metrics = {"objective_score": score}
+            else:
+                raise TypeError(f"Unsupported evaluation output type: {type(eval_output)}")
+
+            if self.evaluation_cache is not None:
+                self.evaluation_cache[cache_key] = (metrics, score)
+
+            return metrics, score, None
+        except Exception as e:
+            logger.error("SA evaluation failed for config %s: %s", config, e, exc_info=True)
+            return {}, None, str(e)
+
+    def _generate_neighbor(self, current: ChunkConfig) -> ChunkConfig:
+        """Generate a random perturbed valid neighboring configuration within search bounds."""
+        bounds = self.sa_config.bounds
+        for _ in range(50):
+            # Sample discrete perturbation
+            d_size = random.choice([-self.sa_config.chunk_step, 0, self.sa_config.chunk_step])
+            d_overlap = random.choice([-self.sa_config.overlap_step, 0, self.sa_config.overlap_step])
+            if d_size == 0 and d_overlap == 0:
+                d_size = random.choice([-self.sa_config.chunk_step, self.sa_config.chunk_step])
+
+            new_size = max(bounds.min_chunk_size, min(bounds.max_chunk_size, current.chunk_size + d_size))
+            new_overlap = max(bounds.min_chunk_overlap, min(bounds.max_chunk_overlap, current.chunk_overlap + d_overlap))
+
+            # Enforce valid overlap constraint
+            if new_overlap < new_size and (new_size != current.chunk_size or new_overlap != current.chunk_overlap):
+                return ChunkConfig(chunk_size=new_size, chunk_overlap=new_overlap)
+
+        # Fallback safe tweak
+        fallback_size = min(bounds.max_chunk_size, current.chunk_size + self.sa_config.chunk_step)
+        fallback_overlap = min(fallback_size - 10, current.chunk_overlap)
+        return ChunkConfig(chunk_size=fallback_size, chunk_overlap=fallback_overlap)
+
+    def optimize(
+        self,
+        held_out_samples: Optional[Sequence[EvaluationSample]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> OptimizationResult:
+        """Execute Simulated Annealing optimization.
+
+        Args:
+            held_out_samples: Optional held-out test set for generalization testing.
+            progress_callback: Optional callback for UI / progress reporting.
+
+        Returns:
+            OptimizationResult: Final summary with complete trial history.
+        """
+        start_time = time.perf_counter()
+        history: List[CandidateTrial] = []
+        trial_id = 1
+        iteration = 1
+
+        # 1. Evaluate baseline
+        base_t0 = time.perf_counter()
+        base_metrics, base_score, base_err = self._run_single_evaluation(self.baseline_config)
+        base_time = time.perf_counter() - base_t0
+
+        if base_score is None:
+            raise RuntimeError(f"Baseline configuration evaluation failed: {base_err}")
+
+        current_config = self.baseline_config
+        current_score = base_score
+        current_metrics = base_metrics
+
+        best_config = self.baseline_config
+        best_score = base_score
+        best_metrics = base_metrics
+
+        history.append(
+            CandidateTrial(
+                trial_id=trial_id,
+                iteration=iteration,
+                config=self.baseline_config,
+                step_size=self.sa_config.chunk_step,
+                metrics=base_metrics,
+                objective_score=base_score,
+                status="baseline",
+                decision_reason="Initial baseline configuration",
+                execution_time_seconds=base_time,
+            )
+        )
+
+        temperature = self.sa_config.initial_temperature
+        accepted_count = 0
+        stopping_reason = "max_trials_reached"
+
+        while temperature >= self.sa_config.min_temperature and trial_id < self.sa_config.max_trials:
+            iteration += 1
+            for _ in range(self.sa_config.steps_per_temperature):
+                trial_id += 1
+                if trial_id > self.sa_config.max_trials:
+                    break
+
+                candidate = self._generate_neighbor(current_config)
+
+                cand_t0 = time.perf_counter()
+                cand_metrics, cand_score, cand_err = self._run_single_evaluation(candidate)
+                cand_time = time.perf_counter() - cand_t0
+
+                if cand_score is None:
+                    history.append(
+                        CandidateTrial(
+                            trial_id=trial_id,
+                            iteration=iteration,
+                            config=candidate,
+                            step_size=self.sa_config.chunk_step,
+                            metrics={},
+                            objective_score=None,
+                            status="failed",
+                            decision_reason=f"Evaluation error: {cand_err}",
+                            execution_time_seconds=cand_time,
+                        )
+                    )
+                    continue
+
+                delta_e = cand_score - current_score
+
+                if delta_e >= 0:
+                    # Improvement: always accept
+                    accept = True
+                    decision_reason = f"Metropolis improvement (ΔE = +{delta_e:.4f}, T={temperature:.3f})"
+                else:
+                    # Probabilistic acceptance of worse state to escape local minima
+                    prob = math.exp(delta_e / max(1e-6, temperature))
+                    accept = random.random() < prob
+                    if accept:
+                        decision_reason = f"Metropolis accepted worse move (ΔE = {delta_e:.4f}, P={prob:.3f}, T={temperature:.3f})"
+                    else:
+                        decision_reason = f"Metropolis rejected worse move (ΔE = {delta_e:.4f}, P={prob:.3f}, T={temperature:.3f})"
+
+                if accept:
+                    current_config = candidate
+                    current_score = cand_score
+                    current_metrics = cand_metrics
+                    accepted_count += 1
+                    status = "accepted"
+
+                    if cand_score > best_score:
+                        best_config = candidate
+                        best_score = cand_score
+                        best_metrics = cand_metrics
+                else:
+                    status = "rejected"
+
+                history.append(
+                    CandidateTrial(
+                        trial_id=trial_id,
+                        iteration=iteration,
+                        config=candidate,
+                        step_size=self.sa_config.chunk_step,
+                        metrics=cand_metrics,
+                        objective_score=cand_score,
+                        status=status,
+                        decision_reason=decision_reason,
+                        execution_time_seconds=cand_time,
+                    )
+                )
+
+                if progress_callback:
+                    progress_callback({
+                        "trial_id": trial_id,
+                        "iteration": iteration,
+                        "temperature": temperature,
+                        "current_config": current_config.to_dict(),
+                        "best_config": best_config.to_dict(),
+                        "best_score": best_score,
+                    })
+
+            # Cooling schedule: geometric decay
+            temperature *= self.sa_config.cooling_rate
+
+        if temperature < self.sa_config.min_temperature:
+            stopping_reason = f"Temperature cooled below minimum threshold ({self.sa_config.min_temperature})"
+
+        total_time = time.perf_counter() - start_time
+
+        # Held-out generalization evaluation
+        held_out_eval = None
+        if held_out_samples:
+            try:
+                ho_eval = self._evaluate_fn(best_config)
+                if isinstance(ho_eval, EvaluationReport):
+                    held_out_eval = ho_eval.aggregate_metrics
+                elif isinstance(ho_eval, dict):
+                    held_out_eval = ho_eval
+            except Exception as exc:
+                logger.warning("Held-out evaluation failed: %s", exc)
+
+        return OptimizationResult(
+            baseline_config=self.baseline_config,
+            baseline_metrics=base_metrics,
+            baseline_score=base_score,
+            selected_config=best_config,
+            selected_metrics=best_metrics,
+            selected_score=best_score,
+            improvement=round(best_score - base_score, 4),
+            candidate_history=history,
+            stopping_reason=stopping_reason,
+            total_iterations=iteration,
+            total_trials=len(history),
+            accepted_trials=accepted_count,
+            total_execution_time_seconds=total_time,
+            optimization_dataset_id=self.dataset_id,
+            held_out_evaluation=held_out_eval,
+            metadata={
+                "algorithm": "simulated_annealing",
+                "initial_temperature": self.sa_config.initial_temperature,
+                "final_temperature": round(temperature, 4),
+                "cooling_rate": self.sa_config.cooling_rate,
+            },
+        )
+
+
+# ==============================================================================
+# RANDOM SEARCH HYPERPARAMETER OPTIMIZATION
+# ==============================================================================
+
+
+@dataclass
+class RandomSearchConfig:
+    """Hyperparameters governing random chunking parameter search."""
+
+    num_trials: int = 15
+    bounds: SearchBounds = field(default_factory=SearchBounds)
+    objective: OptimizationObjective = field(default_factory=OptimizationObjective)
+    random_seed: int = 42
+    step_multiple: int = 25  # Snap samples to discrete step multiples for realistic chunking
+    max_trials: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        """Validate trial budget and support max_trials alias."""
+        if self.max_trials is not None:
+            self.num_trials = self.max_trials
+        if self.num_trials <= 0:
+            raise ValueError(f"num_trials must be at least 1, got {self.num_trials}")
+
+
+class RandomSearchOptimizer:
+    """Uniform random search optimizer for chunk size and overlap hyperparameter exploration.
+
+    Samples uniformly from valid parameter space bounded by SearchBounds while enforcing
+    the relational constraint chunk_overlap < chunk_size. Evaluates candidate configurations
+    strictly on the optimization training questions without accessing held-out test data.
+    """
+
+    def __init__(
+        self,
+        baseline_config: Optional[ChunkConfig] = None,
+        random_config: Optional[RandomSearchConfig] = None,
+        config: Optional[RandomSearchConfig] = None,
+        evaluate_fn: Optional[Callable[[ChunkConfig], Union[EvaluationReport, Dict[str, Any], float]]] = None,
+        documents: Optional[Sequence[LoadedDocument]] = None,
+        pipeline: Optional[RAGPipeline] = None,
+        evaluator: Optional[Evaluator] = None,
+        optimization_samples: Optional[Sequence[EvaluationSample]] = None,
+        collection_name: Optional[str] = None,
+        dataset_id: str = "synthetic_demonstration_dataset",
+        evaluation_cache: Optional[Dict[Tuple[int, int], Tuple[Dict[str, Any], float]]] = None,
+    ) -> None:
+        """Initialize random search optimizer."""
+        self.random_config = config or random_config or RandomSearchConfig()
+        self.baseline_config = baseline_config or ChunkConfig(500, 50)
+        self.dataset_id = dataset_id
+        self.collection_name = collection_name or "rerag_rand_collection"
+        self.evaluation_cache = evaluation_cache
+
+        if evaluate_fn is not None:
+            self._evaluate_fn = evaluate_fn
+        elif documents is not None and pipeline is not None and evaluator is not None and optimization_samples is not None:
+            self._evaluate_fn = self._create_pipeline_evaluator(
+                documents=documents,
+                pipeline=pipeline,
+                evaluator=evaluator,
+                samples=optimization_samples,
+                collection_name=self.collection_name,
+            )
+        else:
+            raise ValueError(
+                "RandomSearchOptimizer requires either `evaluate_fn` or "
+                "(`documents`, `pipeline`, `evaluator`, `optimization_samples`)."
+            )
+
+        self._rng = random.Random(self.random_config.random_seed)
+
+    def _create_pipeline_evaluator(
+        self,
+        documents: Sequence[LoadedDocument],
+        pipeline: RAGPipeline,
+        evaluator: Evaluator,
+        samples: Sequence[EvaluationSample],
+        collection_name: str,
+    ) -> Callable[[ChunkConfig], EvaluationReport]:
+        """Create evaluation function that rebuilds index and evaluates pipeline."""
+        def _eval_config(config: ChunkConfig) -> EvaluationReport:
+            chunker = TextChunker(
+                chunk_size=config.chunk_size,
+                chunk_overlap=config.chunk_overlap,
+            )
+            pipeline.index_documents(
+                documents=documents,
+                chunker=chunker,
+                collection_name=collection_name,
+            )
+            return evaluator.evaluate(
+                samples=samples,
+                deterministic=True,
+                config_override=config.to_dict(),
+                collection_name=collection_name,
+            )
+
+        return _eval_config
+
+    def _run_single_evaluation(
+        self,
+        config: ChunkConfig,
+    ) -> Tuple[Dict[str, Any], Optional[float], Optional[str]]:
+        """Safely execute evaluation callable for a single configuration."""
+        cache_key = (config.chunk_size, config.chunk_overlap)
+        if self.evaluation_cache is not None and cache_key in self.evaluation_cache:
+            cached_metrics, cached_score = self.evaluation_cache[cache_key]
+            return cached_metrics, cached_score, None
+
+        try:
+            eval_output = self._evaluate_fn(config)
+            if isinstance(eval_output, EvaluationReport):
+                metrics = eval_output.aggregate_metrics
+                score = self.random_config.objective.calculate_score(metrics)
+            elif isinstance(eval_output, tuple) and len(eval_output) == 2:
+                metrics, score = eval_output
+                if isinstance(score, (int, float)):
+                    score = round(float(score), 4)
+                if not isinstance(metrics, dict):
+                    metrics = {"objective_score": score}
+            elif isinstance(eval_output, dict):
+                metrics = eval_output
+                score = self.random_config.objective.calculate_score(metrics)
+            elif isinstance(eval_output, (int, float)):
+                score = round(float(eval_output), 4)
+                metrics = {"objective_score": score}
+            else:
+                raise TypeError(f"Unsupported evaluation output type: {type(eval_output)}")
+
+            if self.evaluation_cache is not None:
+                self.evaluation_cache[cache_key] = (metrics, score)
+
+            return metrics, score, None
+        except Exception as e:
+            logger.error("Random search evaluation failed for config %s: %s", config, e, exc_info=True)
+            return {}, None, str(e)
+
+    def _sample_candidate(self, existing_configs: Set[Tuple[int, int]]) -> ChunkConfig:
+        """Sample a valid, non-redundant chunk configuration within search bounds."""
+        bounds = self.random_config.bounds
+        mult = max(1, self.random_config.step_multiple)
+
+        min_sz_step = math.ceil(bounds.min_chunk_size / mult)
+        max_sz_step = math.floor(bounds.max_chunk_size / mult)
+
+        for _ in range(200):
+            sz = self._rng.randint(min_sz_step, max_sz_step) * mult
+            sz = max(bounds.min_chunk_size, min(bounds.max_chunk_size, sz))
+
+            max_ov = min(bounds.max_chunk_overlap, sz - 1)
+            min_ov = bounds.min_chunk_overlap
+
+            if max_ov < min_ov:
+                continue
+
+            min_ov_step = math.ceil(min_ov / mult)
+            max_ov_step = math.floor(max_ov / mult)
+
+            if max_ov_step >= min_ov_step:
+                ov = self._rng.randint(min_ov_step, max_ov_step) * mult
+            else:
+                ov = min_ov
+
+            ov = max(min_ov, min(max_ov, ov))
+
+            if ov < sz and (sz, ov) not in existing_configs:
+                return ChunkConfig(chunk_size=sz, chunk_overlap=ov)
+
+        fallback_sz = max(bounds.min_chunk_size, min(bounds.max_chunk_size, self.baseline_config.chunk_size + mult))
+        fallback_ov = min(fallback_sz - 1, self.baseline_config.chunk_overlap)
+        return ChunkConfig(chunk_size=fallback_sz, chunk_overlap=fallback_ov)
+
+    def optimize(
+        self,
+        baseline_config: Optional[ChunkConfig] = None,
+        held_out_samples: Optional[Sequence[EvaluationSample]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> OptimizationResult:
+        """Run uniform random hyperparameter exploration over chunk size and overlap."""
+        if baseline_config is not None:
+            self.baseline_config = baseline_config
+        start_time = time.perf_counter()
+        history: List[CandidateTrial] = []
+        seen_configs: Set[Tuple[int, int]] = set()
+
+        # 1. Baseline trial
+        base_t0 = time.perf_counter()
+        base_metrics, base_score, base_err = self._run_single_evaluation(self.baseline_config)
+        base_time = time.perf_counter() - base_t0
+
+        if base_score is None:
+            raise RuntimeError(f"Baseline configuration evaluation failed: {base_err}")
+
+        best_config = self.baseline_config
+        best_score = base_score
+        best_metrics = base_metrics
+        accepted_count = 0
+
+        seen_configs.add((self.baseline_config.chunk_size, self.baseline_config.chunk_overlap))
+
+        history.append(
+            CandidateTrial(
+                trial_id=1,
+                iteration=1,
+                config=self.baseline_config,
+                step_size=self.random_config.step_multiple,
+                metrics=base_metrics,
+                objective_score=base_score,
+                status="baseline",
+                decision_reason="Initial baseline configuration",
+                execution_time_seconds=base_time,
+            )
+        )
+
+        num_trials = max(1, self.random_config.num_trials)
+
+        for trial_id in range(2, num_trials + 1):
+            candidate = self._sample_candidate(seen_configs)
+            seen_configs.add((candidate.chunk_size, candidate.chunk_overlap))
+
+            cand_t0 = time.perf_counter()
+            cand_metrics, cand_score, cand_err = self._run_single_evaluation(candidate)
+            cand_time = time.perf_counter() - cand_t0
+
+            if cand_score is None:
+                history.append(
+                    CandidateTrial(
+                        trial_id=trial_id,
+                        iteration=trial_id,
+                        config=candidate,
+                        step_size=self.random_config.step_multiple,
+                        metrics={},
+                        objective_score=None,
+                        status="failed",
+                        decision_reason=f"Evaluation failed: {cand_err}",
+                        execution_time_seconds=cand_time,
+                    )
+                )
+                continue
+
+            delta = cand_score - best_score
+            if delta > 0.0:
+                best_config = candidate
+                best_score = cand_score
+                best_metrics = cand_metrics
+                accepted_count += 1
+                status = "accepted"
+                decision_reason = f"Random search improvement over previous best (Δ = +{delta:.4f})"
+            else:
+                status = "rejected"
+                decision_reason = f"Random search sub-optimal score ({cand_score:.4f} <= {best_score:.4f})"
+
+            history.append(
+                CandidateTrial(
+                    trial_id=trial_id,
+                    iteration=trial_id,
+                    config=candidate,
+                    step_size=self.random_config.step_multiple,
+                    metrics=cand_metrics,
+                    objective_score=cand_score,
+                    status=status,
+                    decision_reason=decision_reason,
+                    execution_time_seconds=cand_time,
+                )
+            )
+
+            if progress_callback:
+                progress_callback({
+                    "trial_id": trial_id,
+                    "iteration": trial_id,
+                    "candidate_config": candidate.to_dict(),
+                    "candidate_score": cand_score,
+                    "best_config": best_config.to_dict(),
+                    "best_score": best_score,
+                    "status": status,
+                })
+
+        total_time = time.perf_counter() - start_time
+
+        # Held-out evaluation if requested
+        held_out_eval = None
+        if held_out_samples:
+            try:
+                ho_eval = self._evaluate_fn(best_config)
+                if isinstance(ho_eval, EvaluationReport):
+                    held_out_eval = ho_eval.aggregate_metrics
+                elif isinstance(ho_eval, dict):
+                    held_out_eval = ho_eval
+            except Exception as exc:
+                logger.warning("Held-out evaluation failed: %s", exc)
+
+        return OptimizationResult(
+            baseline_config=self.baseline_config,
+            baseline_metrics=base_metrics,
+            baseline_score=base_score,
+            selected_config=best_config,
+            selected_metrics=best_metrics,
+            selected_score=best_score,
+            improvement=round(best_score - base_score, 4),
+            candidate_history=history,
+            stopping_reason=f"Completed configured {num_trials} random trials",
+            total_iterations=num_trials,
+            total_trials=len(history),
+            accepted_trials=accepted_count,
+            total_execution_time_seconds=total_time,
+            optimization_dataset_id=self.dataset_id,
+            held_out_evaluation=held_out_eval,
+            metadata={
+                "algorithm": "random_search",
+                "num_trials": num_trials,
+                "step_multiple": self.random_config.step_multiple,
+                "random_seed": self.random_config.random_seed,
+            },
+        )
+
+
+class ChunkOptimizerFactory:
+    """Factory creating configured chunk optimizers by strategy name."""
+
+    @staticmethod
+    def create(
+        strategy: str,
+        baseline_config: Optional[ChunkConfig] = None,
+        search_bounds: Optional[SearchBounds] = None,
+        objective: Optional[OptimizationObjective] = None,
+        random_seed: int = 42,
+        max_trials: int = 15,
+        evaluate_fn: Optional[Callable[[ChunkConfig], Union[EvaluationReport, Dict[str, Any], float]]] = None,
+        documents: Optional[Sequence[LoadedDocument]] = None,
+        pipeline: Optional[RAGPipeline] = None,
+        evaluator: Optional[Evaluator] = None,
+        optimization_samples: Optional[Sequence[EvaluationSample]] = None,
+        collection_name: Optional[str] = None,
+        dataset_id: str = "synthetic_demonstration_dataset",
+        evaluation_cache: Optional[Dict[Tuple[int, int], Tuple[Dict[str, Any], float]]] = None,
+        **kwargs: Any,
+    ) -> Union[AdaptiveChunkOptimizer, RandomSearchOptimizer, SimulatedAnnealingOptimizer]:
+        """Instantiate optimizer for the requested strategy."""
+        strat = strategy.lower().strip()
+        bounds = search_bounds or SearchBounds()
+        obj = objective or OptimizationObjective()
+
+        if strat in ("greedy", "adaptive", "coordinate", "original"):
+            cfg = AdaptiveSearchConfig(
+                bounds=bounds,
+                objective=obj,
+                random_seed=random_seed,
+                max_iterations=kwargs.get("max_iterations", max_trials),
+                initial_step_size=kwargs.get("initial_step_size", 100),
+                initial_overlap_step=kwargs.get("initial_overlap_step", 25),
+                step_decay=kwargs.get("step_decay", 0.5),
+                improvement_tolerance=kwargs.get("improvement_tolerance", 0.005),
+            )
+            return AdaptiveChunkOptimizer(
+                baseline_config=baseline_config,
+                search_config=cfg,
+                evaluate_fn=evaluate_fn,
+                documents=documents,
+                pipeline=pipeline,
+                evaluator=evaluator,
+                optimization_samples=optimization_samples,
+                collection_name=collection_name,
+                dataset_id=dataset_id,
+                evaluation_cache=evaluation_cache,
+            )
+        elif strat in ("random", "random_search"):
+            r_cfg = RandomSearchConfig(
+                num_trials=max_trials,
+                bounds=bounds,
+                objective=obj,
+                random_seed=random_seed,
+                step_multiple=kwargs.get("step_multiple", 25),
+            )
+            return RandomSearchOptimizer(
+                baseline_config=baseline_config,
+                random_config=r_cfg,
+                evaluate_fn=evaluate_fn,
+                documents=documents,
+                pipeline=pipeline,
+                evaluator=evaluator,
+                optimization_samples=optimization_samples,
+                collection_name=collection_name,
+                dataset_id=dataset_id,
+                evaluation_cache=evaluation_cache,
+            )
+        elif strat in ("simulated_annealing", "sa", "annealing"):
+            sa_cfg = SimulatedAnnealingConfig(
+                initial_temperature=kwargs.get("initial_temperature", 1.0),
+                min_temperature=kwargs.get("min_temperature", 0.05),
+                cooling_rate=kwargs.get("cooling_rate", 0.80),
+                steps_per_temperature=kwargs.get("steps_per_temperature", 2),
+                max_trials=max_trials,
+                chunk_step=kwargs.get("chunk_step", 100),
+                overlap_step=kwargs.get("overlap_step", 25),
+                bounds=bounds,
+                objective=obj,
+                random_seed=random_seed,
+            )
+            return SimulatedAnnealingOptimizer(
+                baseline_config=baseline_config,
+                sa_config=sa_cfg,
+                evaluate_fn=evaluate_fn,
+                documents=documents,
+                pipeline=pipeline,
+                evaluator=evaluator,
+                optimization_samples=optimization_samples,
+                collection_name=collection_name,
+                dataset_id=dataset_id,
+                evaluation_cache=evaluation_cache,
+            )
+        else:
+            raise ValueError(
+                f"Unknown optimization strategy: '{strategy}'. Supported strategies: 'greedy', 'random', 'simulated_annealing'"
+            )
+
+
+def get_optimizer(strategy: str = "greedy", **kwargs: Any) -> Any:
+    """Convenience helper to obtain a chunk optimizer by strategy name."""
+    return ChunkOptimizerFactory.create(strategy=strategy, **kwargs)
+
+
 # Backward compatibility classes
 @dataclass
 class ParameterGrid:
@@ -1172,4 +1950,5 @@ class ReRAGOptimizer:
         samples: List[EvaluationSample],
     ) -> OptimizationResult:
         """Execute grid search across parameter grid."""
-        raise NotImplementedError("Use AdaptiveChunkOptimizer for adaptive greedy parameter optimization.")
+        raise NotImplementedError("Use AdaptiveChunkOptimizer or SimulatedAnnealingOptimizer for parameter optimization.")
+

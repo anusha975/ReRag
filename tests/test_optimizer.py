@@ -34,6 +34,8 @@ from src.optimizer import (
     ParameterGrid,
     ReRAGOptimizer,
     SearchBounds,
+    SimulatedAnnealingConfig,
+    SimulatedAnnealingOptimizer,
 )
 from src.rag_pipeline import RAGPipeline
 from src.retriever import Retriever
@@ -663,3 +665,36 @@ def test_experiment_runner_resume_flow(tmp_path: Path, mock_embedder):
     assert resumed_result.total_iterations == 2
     assert (tmp_path / "phase2_test.json").exists()
     assert (tmp_path / "phase2_test.csv").exists()
+
+
+def test_simulated_annealing_optimizer_execution():
+    """Verify Simulated Annealing explores search space and returns OptimizationResult."""
+    # Objective function with peak at (600, 75)
+    def mock_eval(config: ChunkConfig) -> float:
+        # Distance penalty from optimal point (600, 75)
+        dist = ((config.chunk_size - 600) / 100) ** 2 + ((config.chunk_overlap - 75) / 25) ** 2
+        return max(0.1, 1.0 - 0.1 * dist)
+
+    sa_cfg = SimulatedAnnealingConfig(
+        initial_temperature=1.0,
+        min_temperature=0.1,
+        cooling_rate=0.7,
+        steps_per_temperature=2,
+        max_trials=10,
+        random_seed=42,
+    )
+    opt = SimulatedAnnealingOptimizer(
+        baseline_config=ChunkConfig(500, 50),
+        sa_config=sa_cfg,
+        evaluate_fn=mock_eval,
+    )
+
+    result = opt.optimize()
+
+    assert isinstance(result, OptimizationResult)
+    assert result.metadata["algorithm"] == "simulated_annealing"
+    assert result.total_trials >= 2
+    assert len(result.candidate_history) == result.total_trials
+    assert result.selected_score >= result.baseline_score
+    assert result.stopping_reason != ""
+

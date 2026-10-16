@@ -56,6 +56,8 @@ data/evaluation/*
 !data/evaluation/.gitkeep
 !data/evaluation/synthetic_demonstration_dataset.json
 !data/evaluation/synthetic_demonstration_dataset.jsonl
+!data/evaluation/expert_qa_dataset.json
+!data/evaluation/expert_qa_dataset.jsonl
 
 # Testing & Coverage
 .pytest_cache/

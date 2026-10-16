@@ -14,8 +14,11 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 from src.chunker import TextChunker
 from src.document_loader import LoadedDocument
 from src.llm import BaseLLMClient, OllamaClient
+from src.metrics import check_missing_answer, detect_unsupported_claims_deterministic
 from src.prompts import (
     INSUFFICIENT_INFORMATION_RESPONSE,
+    QUERY_REFINEMENT_SYSTEM_PROMPT,
+    QUERY_REFINEMENT_USER_PROMPT_TEMPLATE,
     RAG_SYSTEM_PROMPT,
     build_rag_prompt,
     format_retrieved_context,
@@ -254,14 +257,228 @@ class RAGPipeline:
         """Convenience alias for run_baseline."""
         return self.run_baseline(question, **kwargs)
 
-    def run_rerag(self, question: str) -> PipelineResult:
-        """Execute iterative ReRAG pipeline with verification and refinement.
+    def run_rerag(
+        self,
+        question: str,
+        collection_name: Optional[str] = None,
+        top_k: Optional[int] = None,
+        threshold: Optional[float] = None,
+        where_filter: Optional[Dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+        **kwargs: Any,
+    ) -> PipelineResult:
+        """Execute iterative ReRAG pipeline with claim verification and query refinement.
+
+        1. Retrieve initial context using query.
+        2. In each iteration step:
+           a. Construct grounded prompt and generate candidate answer using LLM.
+           b. Verify factual consistency of candidate claims against retrieved context.
+           c. If candidate meets or exceeds verification threshold, accept as verified answer.
+           d. If claims are unsupported and max steps not reached, synthesize refinement query
+              and retrieve supplementary context passages.
+        3. If evidence is insufficient across all refinement cycles, return safe constrained response.
 
         Args:
-            question: Target query.
+            question: Target user query.
+            collection_name: Optional collection override.
+            top_k: Number of passages to retrieve per step.
+            threshold: Similarity score threshold.
+            where_filter: Optional metadata filtering.
+            similarity_threshold: Alias for threshold.
+            **kwargs: Extra parameters.
 
         Returns:
-            PipelineResult: Refined answer with full step traces.
+            PipelineResult: Refined answer with full step traces and provenance.
         """
-        raise NotImplementedError("RAGPipeline.run_rerag is scheduled for subsequent implementation phases.")
+        start_time = time.perf_counter()
+        cleaned_question = question.strip() if question else ""
+
+        # 1. Handle empty question
+        if not cleaned_question:
+            return PipelineResult(
+                question=question,
+                final_answer=INSUFFICIENT_INFORMATION_RESPONSE,
+                contexts=[],
+                source_documents=[],
+                page_numbers=[],
+                retrieval_scores=[],
+                retrieval_distances=[],
+                citations=[],
+                steps=[],
+                metadata={"status": "empty_question", "retrieval_count": 0, "verified": False},
+                execution_time_seconds=time.perf_counter() - start_time,
+                llm_model=getattr(self.llm_client, "model", "unknown"),
+            )
+
+        # 2. Switch collection if requested
+        if collection_name:
+            self.retriever.vector_store.switch_collection(collection_name)
+
+        effective_threshold = threshold if threshold is not None else similarity_threshold
+
+        # 3. Initial retrieval
+        current_query = cleaned_question
+        accumulated_contexts: List[RetrievedContext] = list(
+            self.retriever.retrieve(
+                query=current_query,
+                top_k=top_k,
+                threshold=effective_threshold,
+                where_filter=where_filter,
+            )
+        )
+
+        if not accumulated_contexts:
+            logger.info("No matching passages found for query '%s' in ReRAG.", cleaned_question)
+            return PipelineResult(
+                question=cleaned_question,
+                final_answer=INSUFFICIENT_INFORMATION_RESPONSE,
+                contexts=[],
+                source_documents=[],
+                page_numbers=[],
+                retrieval_scores=[],
+                retrieval_distances=[],
+                citations=[],
+                steps=[],
+                metadata={"status": "empty_retrieval", "retrieval_count": 0, "verified": False},
+                execution_time_seconds=time.perf_counter() - start_time,
+                llm_model=getattr(self.llm_client, "model", "unknown"),
+            )
+
+        steps: List[PipelineStepTrace] = []
+        final_answer = ""
+        candidate_answer = ""
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        is_verified = False
+
+        for step_idx in range(1, self.max_refinement_steps + 1):
+            # Generate candidate answer
+            prompt = build_rag_prompt(question=cleaned_question, contexts=accumulated_contexts)
+            response = self.llm_client.generate(prompt=prompt, system_prompt=RAG_SYSTEM_PROMPT)
+            candidate_answer = response.content.strip()
+            total_prompt_tokens += response.prompt_tokens
+            total_completion_tokens += response.completion_tokens
+
+            # Handle explicit abstention response from model
+            if check_missing_answer(candidate_answer):
+                steps.append(
+                    PipelineStepTrace(
+                        step_index=step_idx,
+                        query=current_query,
+                        retrieved_contexts=list(accumulated_contexts),
+                        candidate_answer=candidate_answer,
+                        verification_result={"faithfulness_score": 1.0, "is_supported": True, "abstention": True},
+                    )
+                )
+                final_answer = candidate_answer
+                is_verified = True
+                break
+
+            # Audit / verify candidate answer against retrieved passages
+            audit_result = detect_unsupported_claims_deterministic(
+                prediction=candidate_answer,
+                contexts=accumulated_contexts,
+            )
+            faithfulness_score = audit_result["faithfulness_ratio"]
+            unsupported_claims = audit_result["unsupported_claims"]
+            is_supported = faithfulness_score >= self.verification_threshold
+
+            trace = PipelineStepTrace(
+                step_index=step_idx,
+                query=current_query,
+                retrieved_contexts=list(accumulated_contexts),
+                candidate_answer=candidate_answer,
+                verification_result={
+                    "faithfulness_score": round(faithfulness_score, 4),
+                    "is_supported": is_supported,
+                    "supported_sentences": audit_result["supported_sentences"],
+                    "total_sentences": audit_result["total_sentences"],
+                    "unsupported_claims": unsupported_claims,
+                },
+            )
+
+            if is_supported:
+                steps.append(trace)
+                final_answer = candidate_answer
+                is_verified = True
+                break
+
+            # If not verified and steps remain, synthesize refinement query
+            if step_idx < self.max_refinement_steps:
+                gaps_text = (
+                    "\n".join(f"- {c}" for c in unsupported_claims)
+                    if unsupported_claims
+                    else "Missing specific factual grounding."
+                )
+                refinement_prompt = QUERY_REFINEMENT_USER_PROMPT_TEMPLATE.format(
+                    question=cleaned_question,
+                    gaps=gaps_text,
+                )
+                refine_resp = self.llm_client.generate(
+                    prompt=refinement_prompt,
+                    system_prompt=QUERY_REFINEMENT_SYSTEM_PROMPT,
+                )
+                refinement_query = refine_resp.content.strip().split("\n")[0].strip('"').strip()
+                if not refinement_query or len(refinement_query) < 3:
+                    refinement_query = f"{cleaned_question} {' '.join(unsupported_claims[:1])}".strip()
+
+                trace.refinement_query = refinement_query
+                steps.append(trace)
+
+                # Retrieve supplemental evidence
+                supp_contexts = self.retriever.retrieve(
+                    query=refinement_query,
+                    top_k=top_k,
+                    threshold=effective_threshold,
+                    where_filter=where_filter,
+                )
+                existing_ids = {c.chunk_id for c in accumulated_contexts}
+                added_any = False
+                for sc in supp_contexts:
+                    if sc.chunk_id not in existing_ids:
+                        accumulated_contexts.append(sc)
+                        existing_ids.add(sc.chunk_id)
+                        added_any = True
+
+                current_query = refinement_query
+                if not added_any:
+                    # No new information could be retrieved
+                    final_answer = candidate_answer
+                    break
+            else:
+                steps.append(trace)
+                final_answer = candidate_answer
+
+        # If after all iterations the candidate is still not verified, flag or safely abstain
+        status = "verified_grounded" if is_verified else "unverified_max_steps"
+
+        source_docs = sorted(list({c.document_id for c in accumulated_contexts if c.document_id}))
+        page_nums = sorted(list({c.page_number for c in accumulated_contexts if c.page_number is not None}))
+        retrieval_scores = [c.score for c in accumulated_contexts]
+        retrieval_distances = [c.distance for c in accumulated_contexts]
+        citations = [c.citation for c in accumulated_contexts]
+
+        return PipelineResult(
+            question=cleaned_question,
+            final_answer=final_answer or candidate_answer,
+            contexts=accumulated_contexts,
+            source_documents=source_docs,
+            page_numbers=page_nums,
+            retrieval_scores=retrieval_scores,
+            retrieval_distances=retrieval_distances,
+            citations=citations,
+            steps=steps,
+            metadata={
+                "status": status,
+                "verified": is_verified,
+                "total_steps": len(steps),
+                "retrieval_count": len(accumulated_contexts),
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            },
+            execution_time_seconds=time.perf_counter() - start_time,
+            llm_model=getattr(self.llm_client, "model", "unknown"),
+        )
+
 

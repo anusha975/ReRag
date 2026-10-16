@@ -23,7 +23,9 @@ import pandas as pd
 import streamlit as st
 
 from src.chunker import TextChunk, TextChunker
+from src.comparison_runner import ComparisonMethodResult, ComparisonResult, ComparisonRunner
 from src.config import Settings, get_settings
+from src.dataset_workflow import DatasetSplits, DatasetValidator, split_train_val_test
 from src.document_loader import (
     DocumentExtractionError,
     DocumentLoader,
@@ -41,9 +43,14 @@ from src.optimizer import (
     AdaptiveSearchConfig,
     CandidateTrial,
     ChunkConfig,
+    ChunkOptimizerFactory,
     OptimizationObjective,
     OptimizationResult,
+    RandomSearchConfig,
+    RandomSearchOptimizer,
     SearchBounds,
+    SimulatedAnnealingConfig,
+    SimulatedAnnealingOptimizer,
 )
 from src.prompts import INSUFFICIENT_INFORMATION_RESPONSE
 from src.rag_pipeline import PipelineResult, RAGPipeline
@@ -54,8 +61,11 @@ from ui.components import (
     render_candidate_chart,
     render_candidate_table,
     render_comparison_view,
+    render_dataset_split_summary,
     render_empty_state,
     render_header,
+    render_multi_method_charts,
+    render_multi_method_comparison_table,
     render_retrieved_passage,
     render_sidebar_config,
     render_status_badge,
@@ -87,6 +97,8 @@ def init_session_state(settings: Settings) -> None:
         st.session_state.chat_history = []
     if "latest_optimization_result" not in st.session_state:
         st.session_state.latest_optimization_result = None
+    if "latest_comparison_result" not in st.session_state:
+        st.session_state.latest_comparison_result = None
     if "is_optimizing" not in st.session_state:
         st.session_state.is_optimizing = False
     if "offline_mode" not in st.session_state:
@@ -627,6 +639,7 @@ def render_rag_chat(settings: Settings) -> None:
 
 
 # ==============================================================================
+# ==============================================================================
 # SECTION 3: OPTIMIZATION LAB
 # ==============================================================================
 
@@ -635,9 +648,9 @@ def render_optimization_lab(settings: Settings) -> None:
     """Render the Adaptive Chunk Optimization Lab section."""
     st.markdown("## 🧪 Optimization Lab")
     st.markdown(
-        "Execute a **greedy adaptive coordinate search** to discover optimal chunk-size and chunk-overlap "
-        "hyperparameters. Evaluations enforce factual faithfulness and context grounding to prevent "
-        "superficial semantic hallucination masking."
+        "Execute chunk parameter optimization across chunk-size and chunk-overlap hyperparameters. "
+        "Choose between the original IEEE ReRAG greedy coordinate search baseline, random search, "
+        "simulated annealing, or run an empirical controlled multi-method comparison across all strategies."
     )
 
     doc: Optional[LoadedDocument] = st.session_state.loaded_document
@@ -648,6 +661,19 @@ def render_optimization_lab(settings: Settings) -> None:
     if not dataset_files:
         st.warning(f"No benchmark evaluation datasets found in `{eval_dir}`.")
         return
+
+    # Strategy Selection
+    opt_mode = st.radio(
+        "Optimization Strategy / Mode:",
+        options=[
+            "Greedy Coordinate Search (Original ReRAG Baseline)",
+            "Random Search (Stochastic Uniform Exploration)",
+            "Simulated Annealing (Probabilistic Acceptance)",
+            "Controlled Multi-Method Comparison (All 4 Methods)",
+        ],
+        index=3,
+        horizontal=True,
+    )
 
     # Configuration layout
     col_left, col_right = st.columns([1, 1])
@@ -673,7 +699,7 @@ def render_optimization_lab(settings: Settings) -> None:
             initial_step = st.number_input("Initial Step Size", min_value=25, max_value=500, value=100, step=25)
 
     with col_right:
-        st.markdown("### ⚖️ Multi-Metric Objective & Stopping")
+        st.markdown("### ⚖️ Multi-Metric Objective & Parameters")
         st.caption("Configurable objective weights. Prohibits optimizing semantic similarity alone.")
 
         w_faith = st.slider("Weight: Faithfulness Ratio", min_value=0.0, max_value=1.0, value=0.40, step=0.05)
@@ -684,11 +710,38 @@ def render_optimization_lab(settings: Settings) -> None:
             st.error("Total metric weights cannot sum to zero.")
             return
 
-        st.markdown("##### Stopping Conditions & Tolerance:")
+        st.markdown("##### Strategy-Specific Hyperparameters:")
         s_c1, s_c2 = st.columns(2)
         with s_c1:
-            max_iterations = st.number_input("Max Search Iterations", min_value=1, max_value=15, value=5, step=1)
-            step_decay = st.number_input("Step Decay Factor", min_value=0.1, max_value=0.9, value=0.5, step=0.1)
+            if "Random" in opt_mode:
+                rs_trials = st.number_input("Random Search Budget (Trials)", min_value=2, max_value=50, value=8, step=1)
+                max_iterations = 5
+                step_decay = 0.5
+                sa_temp = 1.0
+                sa_cooling = 0.85
+                sa_iters = 8
+            elif "Simulated Annealing" in opt_mode:
+                sa_temp = st.number_input("Initial Temperature (T0)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
+                sa_cooling = st.number_input("Cooling Rate (alpha)", min_value=0.5, max_value=0.99, value=0.85, step=0.05)
+                sa_iters = st.number_input("Max SA Iterations", min_value=2, max_value=30, value=8, step=1)
+                max_iterations = 5
+                step_decay = 0.5
+                rs_trials = 8
+            elif "Multi-Method" in opt_mode:
+                max_iterations = st.number_input("Greedy Max Iterations", min_value=1, max_value=10, value=4, step=1)
+                rs_trials = st.number_input("Random Search Budget", min_value=2, max_value=20, value=6, step=1)
+                sa_iters = st.number_input("Simulated Annealing Iters", min_value=2, max_value=20, value=6, step=1)
+                step_decay = 0.5
+                sa_temp = 1.0
+                sa_cooling = 0.85
+            else:  # Greedy baseline
+                max_iterations = st.number_input("Max Search Iterations", min_value=1, max_value=15, value=5, step=1)
+                step_decay = st.number_input("Step Decay Factor", min_value=0.1, max_value=0.9, value=0.5, step=0.1)
+                rs_trials = 8
+                sa_temp = 1.0
+                sa_cooling = 0.85
+                sa_iters = 8
+
         with s_c2:
             improvement_tol = st.number_input("Improvement Tolerance", min_value=0.001, max_value=0.100, value=0.005, step=0.001, format="%.3f")
             random_seed = st.number_input("Random Seed", min_value=1, max_value=9999, value=42, step=1)
@@ -704,17 +757,33 @@ def render_optimization_lab(settings: Settings) -> None:
             format_func=lambda p: p.name,
         )
     with d_c2:
-        eval_held_out = st.checkbox("Evaluate Generalization on Held-Out Test Set (33%)", value=True)
+        eval_held_out = st.checkbox("Strict Zero-Leakage Held-Out Test Evaluation", value=True)
+
+    # Validate dataset and preview partition counts
+    if selected_dataset_file:
+        try:
+            val_result = DatasetValidator.validate_file(selected_dataset_file)
+            if val_result.is_valid:
+                st.caption(f"✅ Dataset Verified: {val_result.total_samples} samples | Adversarial cases: {val_result.negative_samples_count}")
+                # Load sample splits preview
+                raw_samples = load_dataset(selected_dataset_file)
+                preview_splits = split_train_val_test(raw_samples, train_ratio=0.5, val_ratio=0.2, test_ratio=0.3, random_seed=int(random_seed))
+                render_dataset_split_summary(preview_splits)
+            else:
+                st.warning(f"⚠️ Dataset validation warnings: {', '.join(val_result.errors)}")
+        except Exception as exc:
+            st.caption(f"Dataset check note: {exc}")
 
     # Concurrency Lock Guard
     is_running = st.session_state.is_optimizing
 
     st.markdown("<br>", unsafe_allow_html=True)
+    button_label = "▶️ Launch Controlled Multi-Method Comparison" if "Multi-Method" in opt_mode else f"▶️ Start {opt_mode.split('(')[0].strip()} Run"
     start_opt_btn = st.button(
-        "▶️ Start Adaptive Optimization Run",
+        button_label,
         type="primary",
         disabled=is_running,
-        help="Launches greedy coordinate search on the optimization training questions.",
+        help="Launches parameter optimization under the configured search strategy.",
     )
 
     if start_opt_btn:
@@ -723,6 +792,8 @@ def render_optimization_lab(settings: Settings) -> None:
         # Document resolution
         if doc is None:
             sample_pdf = settings.paths.documents_dir / "sample_rerag_paper.pdf"
+            if not sample_pdf.exists():
+                sample_pdf = settings.paths.documents_dir / "ReRAG_Test_Knowledge_Document.pdf"
             if sample_pdf.exists():
                 loader = DocumentLoader()
                 doc = loader.load_file(sample_pdf)
@@ -754,87 +825,142 @@ def render_optimization_lab(settings: Settings) -> None:
             min_step_size=min_step,
         )
 
-        search_cfg = AdaptiveSearchConfig(
-            initial_chunk_size=base_size,
-            initial_chunk_overlap=base_overlap,
-            initial_step_size=initial_step,
-            step_decay=step_decay,
-            improvement_tolerance=improvement_tol,
-            max_iterations=max_iterations,
-            bounds=bounds,
-            objective=objective,
-            random_seed=random_seed,
+        # Isolated vector store collection
+        opt_col_name = f"opt_ui_{int(time.time())}"
+        opt_vs = VectorStore(
+            persist_dir=None,  # Ephemeral for clean isolation
+            collection_name=opt_col_name,
+            embedding_manager=get_shared_embedding_manager(),
         )
-
-        # Live Progress Containers
-        prog_bar = st.progress(0.0)
-        status_box = st.empty()
-        live_table_box = st.empty()
-
-        trials_acc: List[CandidateTrial] = []
-
-        def on_trial_progress(iter_num: int, total_iters: int, trial: CandidateTrial) -> None:
-            trials_acc.append(trial)
-            prog_val = min(1.0, max(0.0, iter_num / max(1, total_iters)))
-            prog_bar.progress(prog_val)
-            c_cfg = getattr(trial, "config", None)
-            c_sz = getattr(c_cfg, "chunk_size", "?")
-            c_ov = getattr(c_cfg, "chunk_overlap", "?")
-            status_box.markdown(
-                f"**Evaluating:** Trial #{trial.trial_id} | Iteration {iter_num}/{total_iters} | "
-                f"Config: `(Size: {c_sz}, Overlap: {c_ov})` | Status: `{trial.status.upper()}`"
-            )
+        opt_retriever = Retriever(vector_store=opt_vs, top_k=settings.retriever.top_k, similarity_threshold=0.0)
+        opt_pipeline = RAGPipeline(retriever=opt_retriever, llm_client=llm_instance)
+        opt_evaluator = Evaluator(pipeline=opt_pipeline, embedding_manager=opt_vs.embedding_manager)
 
         try:
-            # Set up isolated vector store collection
-            opt_col_name = f"opt_ui_{int(time.time())}"
-            opt_vs = VectorStore(
-                persist_dir=None,  # Ephemeral for clean isolation
-                collection_name=opt_col_name,
-                embedding_manager=get_shared_embedding_manager(),
-            )
-            opt_retriever = Retriever(vector_store=opt_vs, top_k=settings.retriever.top_k, similarity_threshold=0.0)
-            opt_pipeline = RAGPipeline(retriever=opt_retriever, llm_client=llm_instance)
-            opt_evaluator = Evaluator(pipeline=opt_pipeline, embedding_manager=opt_vs.embedding_manager)
+            if "Multi-Method" in opt_mode:
+                # Execute full controlled comparison
+                with st.spinner("Executing controlled comparison across Fixed Baseline, Greedy, Random Search, and Simulated Annealing..."):
+                    comp_runner = ComparisonRunner(
+                        settings=settings,
+                        documents=docs_list,
+                        dataset_path=selected_dataset_file,
+                        train_ratio=0.50,
+                        val_ratio=0.20,
+                        test_ratio=0.30 if eval_held_out else 0.0,
+                        random_seed=int(random_seed),
+                        pipeline=opt_pipeline,
+                        evaluator=opt_evaluator,
+                        collection_name=opt_col_name,
+                        results_dir=settings.paths.results_dir,
+                    )
+                    comp_result = comp_runner.run(
+                        baseline_config=ChunkConfig(base_size, base_overlap),
+                        bounds=bounds,
+                        objective=objective,
+                        greedy_kwargs={"max_iterations": int(max_iterations), "initial_step_size": int(initial_step), "step_decay": float(step_decay)},
+                        random_search_kwargs={"max_trials": int(rs_trials), "random_seed": int(random_seed)},
+                        simulated_annealing_kwargs={"initial_temp": float(sa_temp), "cooling_rate": float(sa_cooling), "max_iterations": int(sa_iters)},
+                        save_results=True,
+                    )
 
-            runner = ExperimentRunner(
-                settings=settings,
-                documents=docs_list,
-                dataset_path=selected_dataset_file,
-                test_ratio=0.33 if eval_held_out else 0.0,
-                random_seed=random_seed,
-                pipeline=opt_pipeline,
-                evaluator=opt_evaluator,
-                collection_name=opt_col_name,
-                results_dir=settings.paths.results_dir,
-            )
-
-            with st.spinner("Executing adaptive coordinate search..."):
-                result: OptimizationResult = runner.run_experiment(
-                    baseline_config=ChunkConfig(base_size, base_overlap),
-                    search_config=search_cfg,
-                    evaluate_held_out=eval_held_out,
-                    save_results=True,
-                    progress_callback=on_trial_progress,
+                st.session_state.latest_comparison_result = comp_result
+                st.session_state.is_optimizing = False
+                st.success(
+                    f"🏆 Multi-Method Comparison Complete! Best Held-Out Generalization: "
+                    f"**{comp_result.best_test_method}** | Best Optimization: **{comp_result.best_train_method}**"
                 )
 
-            prog_bar.progress(1.0)
-            status_box.success(
-                f"🎉 Optimization Complete! Selected: Chunk Size {result.selected_config.chunk_size}, "
-                f"Overlap {result.selected_config.chunk_overlap} (Gain: {result.improvement:+.4f}) in {result.total_execution_time_seconds:.1f}s."
-            )
+            else:
+                # Single Strategy Run
+                prog_bar = st.progress(0.0)
+                status_box = st.empty()
 
-            st.session_state.latest_optimization_result = result
-            st.session_state.is_optimizing = False
+                def on_trial_progress(iter_num: int, total_iters: int, trial: CandidateTrial) -> None:
+                    prog_val = min(1.0, max(0.0, iter_num / max(1, total_iters)))
+                    prog_bar.progress(prog_val)
+                    c_cfg = getattr(trial, "config", None)
+                    c_sz = getattr(c_cfg, "chunk_size", "?")
+                    c_ov = getattr(c_cfg, "chunk_overlap", "?")
+                    status_box.markdown(
+                        f"**Evaluating:** Trial #{trial.trial_id} | Iteration {iter_num}/{total_iters} | "
+                        f"Config: `(Size: {c_sz}, Overlap: {c_ov})` | Status: `{trial.status.upper()}`"
+                    )
+
+                if "Random" in opt_mode:
+                    search_cfg = RandomSearchConfig(
+                        max_trials=int(rs_trials),
+                        bounds=bounds,
+                        objective=objective,
+                        random_seed=int(random_seed),
+                    )
+                elif "Simulated Annealing" in opt_mode:
+                    search_cfg = SimulatedAnnealingConfig(
+                        initial_temperature=float(sa_temp),
+                        cooling_rate=float(sa_cooling),
+                        max_iterations=int(sa_iters),
+                        step_size=int(initial_step),
+                        bounds=bounds,
+                        objective=objective,
+                        random_seed=int(random_seed),
+                    )
+                else:
+                    search_cfg = AdaptiveSearchConfig(
+                        initial_chunk_size=base_size,
+                        initial_chunk_overlap=base_overlap,
+                        initial_step_size=initial_step,
+                        step_decay=step_decay,
+                        improvement_tolerance=improvement_tol,
+                        max_iterations=max_iterations,
+                        bounds=bounds,
+                        objective=objective,
+                        random_seed=random_seed,
+                    )
+
+                runner = ExperimentRunner(
+                    settings=settings,
+                    documents=docs_list,
+                    dataset_path=selected_dataset_file,
+                    test_ratio=0.33 if eval_held_out else 0.0,
+                    random_seed=random_seed,
+                    pipeline=opt_pipeline,
+                    evaluator=opt_evaluator,
+                    collection_name=opt_col_name,
+                    results_dir=settings.paths.results_dir,
+                )
+
+                with st.spinner(f"Executing {opt_mode.split('(')[0].strip()}..."):
+                    result: OptimizationResult = runner.run_experiment(
+                        baseline_config=ChunkConfig(base_size, base_overlap),
+                        search_config=search_cfg,
+                        evaluate_held_out=eval_held_out,
+                        save_results=True,
+                        progress_callback=on_trial_progress,
+                    )
+
+                prog_bar.progress(1.0)
+                status_box.success(
+                    f"🎉 Optimization Complete! Selected: Chunk Size {result.selected_config.chunk_size}, "
+                    f"Overlap {result.selected_config.chunk_overlap} (Gain: {result.improvement:+.4f}) in {result.total_execution_time_seconds:.1f}s."
+                )
+
+                st.session_state.latest_optimization_result = result
+                st.session_state.is_optimizing = False
 
         except Exception as exc:
             st.session_state.is_optimizing = False
             st.error(f"Optimization run failed: {exc}")
             logger.exception("Error in optimization run")
 
-    # Display candidate history if available
+    # Display active results if available
+    comp_obj: Optional[ComparisonResult] = st.session_state.latest_comparison_result
+    if comp_obj is not None:
+        st.markdown("---")
+        st.markdown("### 📊 Active Multi-Method Comparison Study")
+        render_multi_method_comparison_table(comp_obj.summary_records)
+        render_multi_method_charts(comp_obj)
+
     res_obj: Optional[OptimizationResult] = st.session_state.latest_optimization_result
-    if res_obj is not None:
+    if res_obj is not None and comp_obj is None:
         st.markdown("---")
         st.markdown(f"#### 📜 Candidate Trials History ({len(res_obj.candidate_history)} Trials Recorded)")
         render_candidate_table(res_obj.candidate_history)
@@ -850,81 +976,111 @@ def render_results_and_comparison(settings: Settings) -> None:
     st.markdown("## 📊 Results and Comparison")
     st.markdown(
         "Examine empirical metrics from completed optimization experiments. "
-        "Inspect parameter improvements, progression trajectories, and held-out test generalization."
+        "Inspect multi-method comparative performance, parameter progression, and held-out test generalization."
     )
 
-    res: Optional[OptimizationResult] = st.session_state.latest_optimization_result
+    comp_res: Optional[ComparisonResult] = st.session_state.latest_comparison_result
+    single_res: Optional[OptimizationResult] = st.session_state.latest_optimization_result
 
-    if res is None:
+    if comp_res is None and single_res is None:
         render_empty_state(
             title="No Experiment Results Available",
             message="No optimization run has been executed in this session or loaded from history. "
-            "Visit the **Optimization Lab** to run a parameter search, or **Experiment History** to load past results.",
+            "Visit the **Optimization Lab** to run an experiment, or **Experiment History** to load past results.",
             icon="📊",
         )
         return
 
-    # Metric Cards
-    render_comparison_view(
-        baseline_metrics=res.baseline_metrics,
-        selected_metrics=res.selected_metrics,
-        baseline_config=res.baseline_config,
-        selected_config=res.selected_config,
-        held_out_evaluation=res.held_out_evaluation,
-    )
+    # If both exist, allow selecting between multi-method study and single-run inspection
+    if comp_res is not None and single_res is not None:
+        view_choice = st.radio(
+            "Select View Mode:",
+            options=["Multi-Method Comparison Study", "Single Run In-Depth Inspection"],
+            horizontal=True,
+        )
+    elif comp_res is not None:
+        view_choice = "Multi-Method Comparison Study"
+    else:
+        view_choice = "Single Run In-Depth Inspection"
 
-    st.markdown("---")
+    # 1. Multi-Method Comparative View
+    if view_choice == "Multi-Method Comparison Study" and comp_res is not None:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.success(f"🏆 **Best Generalization (Held-Out Test):** `{comp_res.best_test_method}`")
+        with c2:
+            st.info(f"🎯 **Best Optimization (Train):** `{comp_res.best_train_method}`")
 
-    # Altair Progression Chart
-    st.markdown("#### 📈 Objective Score Progression across Candidate Trials")
-    render_candidate_chart(res.candidate_history, baseline_score=res.baseline_score)
+        st.markdown("#### 📋 Comparative Performance Summary")
+        render_multi_method_comparison_table(comp_res.summary_records)
 
-    st.markdown("---")
+        st.markdown("---")
+        render_multi_method_charts(comp_res)
 
-    # Additional Experiment Insights
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("##### 📌 Experiment Metadata")
-        st.write({
-            "Stopping Reason": res.stopping_reason,
-            "Total Search Iterations": res.total_iterations,
-            "Total Candidate Trials": res.total_trials,
-            "Accepted Candidates": res.accepted_trials,
-            "Total Execution Time": f"{res.total_execution_time_seconds:.2f} seconds",
-            "Optimization Dataset ID": res.optimization_dataset_id,
-        })
-    with col_b:
-        st.markdown("##### 🔬 Scientific Integrity Findings")
-        gain = res.improvement
-        h_gain = res.held_out_evaluation.get("held_out_gain", 0.0) if res.held_out_evaluation else None
+        st.markdown("---")
+        st.markdown("#### 🔬 Scientific Insights & Generalization")
+        st.markdown(
+            "- **Zero-Leakage Guarantee:** Parameter optimization took place exclusively on the training split. "
+            "Held-out test answers were never inspected during parameter selection.\n"
+            "- **Generalization Gap:** The drop between train and held-out test score reflects whether an optimizer "
+            "overfitted chunk boundaries to the specific training questions.\n"
+            "- **Multi-Metric Integrity:** Objective balances faithfulness, coverage, and similarity to prevent "
+            "superficial semantic hallucination masking."
+        )
 
-        findings = [
-            f"- **Optimization Gain:** {gain:+.4f} on tuning questions.",
-        ]
-        if h_gain is not None:
-            findings.append(f"- **Generalization Gain:** {h_gain:+.4f} on unseen held-out test questions.")
-            if h_gain < gain:
-                findings.append("- *Observation:* Mild generalization drop observed on held-out data (expected in empirical research).")
+    # 2. Single Optimizer Inspection View
+    elif single_res is not None:
+        render_comparison_view(
+            baseline_metrics=single_res.baseline_metrics,
+            selected_metrics=single_res.selected_metrics,
+            baseline_config=single_res.baseline_config,
+            selected_config=single_res.selected_config,
+            held_out_evaluation=single_res.held_out_evaluation,
+        )
+
+        st.markdown("---")
+        st.markdown("#### 📈 Objective Score Progression across Candidate Trials")
+        render_candidate_chart(single_res.candidate_history, baseline_score=single_res.baseline_score)
+
+        st.markdown("---")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("##### 📌 Experiment Metadata")
+            st.write({
+                "Stopping Reason": single_res.stopping_reason,
+                "Total Search Iterations": single_res.total_iterations,
+                "Total Candidate Trials": single_res.total_trials,
+                "Accepted Candidates": single_res.accepted_trials,
+                "Total Execution Time": f"{single_res.total_execution_time_seconds:.2f} seconds",
+                "Optimization Dataset ID": single_res.optimization_dataset_id,
+            })
+        with col_b:
+            st.markdown("##### 🔬 Scientific Integrity Findings")
+            gain = single_res.improvement
+            h_gain = single_res.held_out_evaluation.get("held_out_gain", 0.0) if single_res.held_out_evaluation else None
+            findings = [f"- **Optimization Gain:** {gain:+.4f} on tuning questions."]
+            if h_gain is not None:
+                findings.append(f"- **Generalization Gain:** {h_gain:+.4f} on unseen held-out test questions.")
+                if h_gain < gain:
+                    findings.append("- *Observation:* Mild generalization drop observed on held-out data (expected in empirical research).")
+                else:
+                    findings.append("- *Observation:* Optimization gains successfully generalized to held-out distribution.")
             else:
-                findings.append("- *Observation:* Optimization gains successfully generalized to held-out distribution.")
-        else:
-            findings.append("- *Note:* Held-out test evaluation was not enabled for this experiment run.")
+                findings.append("- *Note:* Held-out test evaluation was not enabled for this experiment run.")
+            st.markdown("\n".join(findings))
 
-        st.markdown("\n".join(findings))
+        st.markdown("---")
+        st.markdown("#### 📋 Candidate Breakdown")
+        status_filter = st.selectbox("Filter by Status", ["All", "Accepted Only", "Rejected Only", "Invalid / Failed"])
+        filtered_trials = single_res.candidate_history
+        if status_filter == "Accepted Only":
+            filtered_trials = [t for t in single_res.candidate_history if t.status in {"accepted", "baseline"}]
+        elif status_filter == "Rejected Only":
+            filtered_trials = [t for t in single_res.candidate_history if t.status == "rejected"]
+        elif status_filter == "Invalid / Failed":
+            filtered_trials = [t for t in single_res.candidate_history if t.status in {"rejected_invalid", "failed"}]
 
-    # Candidate History Table
-    st.markdown("---")
-    st.markdown("#### 📋 Candidate Breakdown")
-    status_filter = st.selectbox("Filter by Status", ["All", "Accepted Only", "Rejected Only", "Invalid / Failed"])
-    filtered_trials = res.candidate_history
-    if status_filter == "Accepted Only":
-        filtered_trials = [t for t in res.candidate_history if t.status in {"accepted", "baseline"}]
-    elif status_filter == "Rejected Only":
-        filtered_trials = [t for t in res.candidate_history if t.status == "rejected"]
-    elif status_filter == "Invalid / Failed":
-        filtered_trials = [t for t in res.candidate_history if t.status in {"rejected_invalid", "failed"}]
-
-    render_candidate_table(filtered_trials)
+        render_candidate_table(filtered_trials)
 
 
 # ==============================================================================
@@ -937,7 +1093,7 @@ def render_experiment_history(settings: Settings) -> None:
     st.markdown("## 📜 Experiment History")
     st.markdown(
         "Browse previously executed optimization results stored in `results/`. "
-        "Load past experiments for side-by-side comparison or download JSON/CSV audit logs."
+        "Load past experiments for comparative analysis or download JSON/CSV audit logs."
     )
 
     results_dir = settings.paths.results_dir
@@ -966,9 +1122,17 @@ def render_experiment_history(settings: Settings) -> None:
 
     if load_btn and selected_file:
         try:
-            loaded_res = OptimizationResult.load_from_json(selected_file)
-            st.session_state.latest_optimization_result = loaded_res
-            st.success(f"Loaded '{selected_file.name}' into active session state!")
+            with open(selected_file, "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+
+            if "methods" in raw_data and "summary_records" in raw_data:
+                loaded_comp = ComparisonResult.load_from_json(selected_file)
+                st.session_state.latest_comparison_result = loaded_comp
+                st.success(f"Loaded multi-method comparison study '{selected_file.name}' into active session state!")
+            else:
+                loaded_res = OptimizationResult.load_from_json(selected_file)
+                st.session_state.latest_optimization_result = loaded_res
+                st.success(f"Loaded single optimization result '{selected_file.name}' into active session state!")
         except Exception as exc:
             st.error(f"Error loading experiment file: {exc}")
 
@@ -977,14 +1141,12 @@ def render_experiment_history(settings: Settings) -> None:
         with open(selected_file, "r", encoding="utf-8") as f:
             raw_json_str = f.read()
 
+        summary_csv = selected_file.parent / f"{selected_file.stem}_summary.csv"
+        trials_csv = selected_file.parent / f"{selected_file.stem}_trials.csv"
         csv_equiv = selected_file.with_suffix(".csv")
-        raw_csv_str = ""
-        if csv_equiv.exists():
-            with open(csv_equiv, "r", encoding="utf-8") as f:
-                raw_csv_str = f.read()
 
-        d_col1, d_col2 = st.columns(2)
-        with d_col1:
+        d_cols = st.columns(3)
+        with d_cols[0]:
             st.download_button(
                 "📥 Download Experiment JSON",
                 data=raw_json_str,
@@ -992,30 +1154,52 @@ def render_experiment_history(settings: Settings) -> None:
                 mime="application/json",
                 use_container_width=True,
             )
-        with d_col2:
-            if raw_csv_str:
+        with d_cols[1]:
+            csv_to_use = summary_csv if summary_csv.exists() else (csv_equiv if csv_equiv.exists() else None)
+            if csv_to_use and csv_to_use.exists():
+                with open(csv_to_use, "r", encoding="utf-8") as f:
+                    summary_csv_str = f.read()
+                st.download_button(
+                    "📥 Download Summary CSV",
+                    data=summary_csv_str,
+                    file_name=csv_to_use.name,
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+        with d_cols[2]:
+            if trials_csv.exists():
+                with open(trials_csv, "r", encoding="utf-8") as f:
+                    trials_csv_str = f.read()
                 st.download_button(
                     "📥 Download Trials CSV",
-                    data=raw_csv_str,
-                    file_name=csv_equiv.name,
+                    data=trials_csv_str,
+                    file_name=trials_csv.name,
                     mime="text/csv",
                     use_container_width=True,
                 )
 
     # Preview loaded result
-    active_res: Optional[OptimizationResult] = st.session_state.latest_optimization_result
-    if active_res is not None:
+    active_comp: Optional[ComparisonResult] = st.session_state.latest_comparison_result
+    active_single: Optional[OptimizationResult] = st.session_state.latest_optimization_result
+
+    if active_comp is not None:
         st.markdown("---")
-        st.markdown(f"### 🔍 Active Result Preview: `{active_res.selected_config}` (Score: {active_res.selected_score:.4f})")
+        st.markdown(f"### 🔍 Active Multi-Method Comparison: Best Test = `{active_comp.best_test_method}`")
+        render_multi_method_comparison_table(active_comp.summary_records)
+        render_multi_method_charts(active_comp)
+    elif active_single is not None:
+        st.markdown("---")
+        st.markdown(f"### 🔍 Active Single Run: `{active_single.selected_config}` (Score: {active_single.selected_score:.4f})")
         render_comparison_view(
-            baseline_metrics=active_res.baseline_metrics,
-            selected_metrics=active_res.selected_metrics,
-            baseline_config=active_res.baseline_config,
-            selected_config=active_res.selected_config,
-            held_out_evaluation=active_res.held_out_evaluation,
+            baseline_metrics=active_single.baseline_metrics,
+            selected_metrics=active_single.selected_metrics,
+            baseline_config=active_single.baseline_config,
+            selected_config=active_single.selected_config,
+            held_out_evaluation=active_single.held_out_evaluation,
         )
         st.markdown("#### Trial Progression")
-        render_candidate_chart(active_res.candidate_history, baseline_score=active_res.baseline_score)
+        render_candidate_chart(active_single.candidate_history, baseline_score=active_single.baseline_score)
+
 
 
 # ==============================================================================

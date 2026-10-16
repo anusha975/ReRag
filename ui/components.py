@@ -518,6 +518,152 @@ def render_candidate_chart(trials: Sequence[Any], baseline_score: Optional[float
     st.altair_chart(chart, use_container_width=True)
 
 
+
+def render_multi_method_comparison_table(summary_records: Sequence[Dict[str, Any]]) -> None:
+    """Render a styled comparative table across all evaluated optimization strategies.
+
+    Displays Chunk Size, Chunk Overlap, Optimization (Train) Score, Validation Score,
+    Held-Out Test Score, Generalization Gap, Faithfulness, Coverage, Similarity,
+    MRR@k, Citation Precision, Latency, and Computational Cost.
+    """
+    if not summary_records:
+        st.info("No comparative summary records available.")
+        return
+
+    df = pd.DataFrame(summary_records)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def render_multi_method_charts(comparison_result: Any) -> None:
+    """Render comparative Altair visualizations for multi-method optimization experiments.
+
+    Generates:
+    1. Grouped bar chart comparing Train vs. Held-Out Test performance across methods.
+    2. Generalization gap bar chart highlighting potential overfitting.
+    3. Multi-series trial convergence trajectories across candidate search steps.
+    """
+    if comparison_result is None:
+        st.info("No comparative data available to visualize.")
+        return
+
+    # Extract methods dict or dict representation
+    methods = getattr(comparison_result, "methods", {})
+    if isinstance(comparison_result, dict):
+        methods = comparison_result.get("methods", {})
+
+    if not methods:
+        st.info("No method details found in comparison result.")
+        return
+
+    # 1. Train vs Test Performance Bar Chart
+    perf_records = []
+    gap_records = []
+    trial_records = []
+
+    for m_id, m_data in methods.items():
+        disp_name = getattr(m_data, "display_name", None) or (m_data.get("display_name") if isinstance(m_data, dict) else m_id)
+        train_score = getattr(m_data, "train_score", None) or (m_data.get("train_score") if isinstance(m_data, dict) else 0.0)
+        test_score = getattr(m_data, "test_score", None) or (m_data.get("test_score") if isinstance(m_data, dict) else 0.0)
+        gen_gap = getattr(m_data, "generalization_gap", None) or (m_data.get("generalization_gap") if isinstance(m_data, dict) else 0.0)
+
+        perf_records.append({"Method": disp_name, "Split": "Optimization / Train", "Score": float(train_score)})
+        perf_records.append({"Method": disp_name, "Split": "Held-Out Test", "Score": float(test_score)})
+        gap_records.append({"Method": disp_name, "Generalization Gap": float(gen_gap)})
+
+        # Trial trajectories
+        candidates = getattr(m_data, "candidate_history", []) or (m_data.get("candidate_history", []) if isinstance(m_data, dict) else [])
+        for cand in candidates:
+            score = getattr(cand, "objective_score", None) or (cand.get("objective_score") if isinstance(cand, dict) else None)
+            if score is not None:
+                t_id = getattr(cand, "trial_id", 0) or (cand.get("trial_id", 0) if isinstance(cand, dict) else 0)
+                status = getattr(cand, "status", "unknown") or (cand.get("status", "unknown") if isinstance(cand, dict) else "unknown")
+                cfg = getattr(cand, "config", None) or (cand.get("config") if isinstance(cand, dict) else None)
+                c_sz = getattr(cfg, "chunk_size", 0) if cfg and hasattr(cfg, "chunk_size") else (cfg.get("chunk_size", 0) if isinstance(cfg, dict) else 0)
+                c_ov = getattr(cfg, "chunk_overlap", 0) if cfg and hasattr(cfg, "chunk_overlap") else (cfg.get("chunk_overlap", 0) if isinstance(cfg, dict) else 0)
+                trial_records.append({
+                    "Method": disp_name,
+                    "Trial": int(t_id),
+                    "Score": float(score),
+                    "Status": str(status).capitalize(),
+                    "Config": f"{c_sz}/{c_ov}",
+                })
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.markdown("##### 📊 Train vs. Held-Out Test Generalization")
+        df_perf = pd.DataFrame(perf_records)
+        chart_perf = (
+            alt.Chart(df_perf)
+            .mark_bar()
+            .encode(
+                x=alt.X("Method:N", title=None, axis=alt.Axis(labelAngle=-25)),
+                y=alt.Y("Score:Q", title="Objective Score", scale=alt.Scale(zero=False)),
+                color=alt.Color(
+                    "Split:N",
+                    scale=alt.Scale(domain=["Optimization / Train", "Held-Out Test"], range=["#3b82f6", "#10b981"]),
+                    title="Evaluation Split",
+                ),
+                xOffset="Split:N",
+                tooltip=["Method", "Split", alt.Tooltip("Score:Q", format=".4f")],
+            )
+            .properties(height=280)
+        )
+        st.altair_chart(chart_perf, use_container_width=True)
+
+    with c2:
+        st.markdown("##### 📉 Generalization Gap (Train - Held-Out)")
+        df_gap = pd.DataFrame(gap_records)
+        chart_gap = (
+            alt.Chart(df_gap)
+            .mark_bar(color="#f59e0b")
+            .encode(
+                x=alt.X("Method:N", title=None, axis=alt.Axis(labelAngle=-25)),
+                y=alt.Y("Generalization Gap:Q", title="Score Drop (Gap)"),
+                tooltip=["Method", alt.Tooltip("Generalization Gap:Q", format=".4f")],
+            )
+            .properties(height=280)
+        )
+        st.altair_chart(chart_gap, use_container_width=True)
+
+    # 2. Multi-Method Convergence Trajectory Chart
+    if trial_records:
+        st.markdown("##### 📈 Trial Trajectories & Search Convergence")
+        df_trials = pd.DataFrame(trial_records)
+        chart_traj = (
+            alt.Chart(df_trials)
+            .mark_line(point=alt.OverlayMarkDef(size=60, filled=True), strokeWidth=2)
+            .encode(
+                x=alt.X("Trial:Q", title="Candidate Trial Index"),
+                y=alt.Y("Score:Q", title="Objective Score", scale=alt.Scale(zero=False)),
+                color=alt.Color("Method:N", title="Method", scale=alt.Scale(scheme="category10")),
+                tooltip=["Method", "Trial", alt.Tooltip("Score:Q", format=".4f"), "Config", "Status"],
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(chart_traj, use_container_width=True)
+
+
+def render_dataset_split_summary(splits: Any) -> None:
+    """Render visual summary badges for train, validation, and held-out test splits."""
+    if splits is None:
+        return
+
+    n_train = len(getattr(splits, "train_samples", []))
+    n_val = len(getattr(splits, "val_samples", []))
+    n_test = len(getattr(splits, "test_samples", []))
+    total = n_train + n_val + n_test
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Total QA Questions", total)
+    with c2:
+        st.metric("Optimization (Train)", n_train, help="Used exclusively during parameter search.")
+    with c3:
+        st.metric("Validation", n_val, help="Used for checkpointing/tuning.")
+    with c4:
+        st.metric("Held-Out Test", n_test, help="Strictly isolated for final uncorrupted evaluation.")
+
+
 def render_sidebar_config(
     settings: Any,
     offline_mode_toggle: bool = False,
@@ -559,3 +705,4 @@ def render_sidebar_config(
         )
 
     return {"offline_mode": offline_mode}
+

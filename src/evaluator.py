@@ -13,18 +13,34 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from src.dataset_workflow import (
+    DatasetSplits,
+    DatasetValidationResult,
+    DatasetValidator,
+    save_dataset_splits,
+    split_train_val_test,
+)
 from src.embeddings import EmbeddingManager
 from src.llm import BaseLLMClient
 from src.metrics import (
     check_missing_answer,
     compute_aggregate_metrics,
+    compute_citation_precision_recall,
     compute_context_coverage,
+    compute_exact_match,
+    compute_grounded_claim_density,
+    compute_hit_rate_at_k,
+    compute_latency_metrics,
+    compute_noise_ratio,
     compute_page_coverage,
+    compute_reciprocal_rank,
     compute_retrieval_precision_at_k,
     compute_retrieval_recall_at_k,
+    compute_rouge_l,
     compute_semantic_similarity,
     compute_source_match,
     compute_token_f1,
+    compute_token_precision_recall,
     detect_unsupported_claims_deterministic,
     llm_judge_faithfulness,
 )
@@ -39,18 +55,33 @@ class EvaluationSample:
 
     sample_id: str
     question: str
-    reference_answer: str
+    reference_answer: str = ""
     expected_source: Optional[str] = None
     expected_pages: Optional[List[int]] = None
     document_id: Optional[str] = None
     relevant_doc_ids: Optional[List[str]] = None
     supporting_passages: Optional[List[str]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    ground_truth_answer: Optional[str] = None
+    expected_passages: Optional[List[str]] = None
+    expected_citations: Optional[List[int]] = None
+    difficulty: Optional[str] = None
+    is_negative: Optional[bool] = None
 
-    @property
-    def ground_truth_answer(self) -> str:
-        """Alias for reference_answer for backwards compatibility."""
-        return self.reference_answer
+    def __post_init__(self) -> None:
+        """Harmonize legacy field aliases and metadata."""
+        if self.ground_truth_answer and not self.reference_answer:
+            self.reference_answer = self.ground_truth_answer
+        elif self.reference_answer and not self.ground_truth_answer:
+            self.ground_truth_answer = self.reference_answer
+        if self.expected_passages and not self.supporting_passages:
+            self.supporting_passages = self.expected_passages
+        if self.expected_citations and not self.expected_pages:
+            self.expected_pages = self.expected_citations
+        if self.difficulty and "difficulty" not in self.metadata:
+            self.metadata["difficulty"] = self.difficulty
+        if self.is_negative is not None and "is_abstention_case" not in self.metadata:
+            self.metadata["is_abstention_case"] = self.is_negative
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> EvaluationSample:
@@ -306,8 +337,18 @@ class Evaluator:
                 embedding_manager=self.embedding_manager,
             )
 
-            # 3. Evaluate token-level lexical F1
-            tok_f1 = compute_token_f1(
+            # 3. Evaluate token-level lexical F1, precision, and recall
+            tok_prec, tok_rec, tok_f1 = compute_token_precision_recall(
+                prediction=generated_answer,
+                reference=sample.reference_answer,
+            )
+
+            # 3b. Exact match and ROUGE-L
+            exact_match = compute_exact_match(
+                prediction=generated_answer,
+                reference=sample.reference_answer,
+            )
+            rouge_l = compute_rouge_l(
                 prediction=generated_answer,
                 reference=sample.reference_answer,
             )
@@ -335,6 +376,21 @@ class Evaluator:
                 relevant_ids=sample.relevant_doc_ids,
                 k=4,
             )
+            recip_rank = compute_reciprocal_rank(
+                retrieved_ids=source_documents,
+                relevant_ids=sample.relevant_doc_ids,
+                k=4,
+            )
+            hit_rate = compute_hit_rate_at_k(
+                retrieved_ids=source_documents,
+                relevant_ids=sample.relevant_doc_ids,
+                k=4,
+            )
+            noise_ratio = compute_noise_ratio(
+                retrieved_ids=source_documents,
+                relevant_ids=sample.relevant_doc_ids,
+                k=4,
+            )
             page_cov = compute_page_coverage(
                 retrieved_pages=page_numbers,
                 expected_pages=sample.expected_pages,
@@ -344,13 +400,26 @@ class Evaluator:
                 expected_source=sample.expected_source or sample.document_id,
             )
 
-            # 7. Unsupported claim check (deterministic)
+            # 7. Unsupported claim check and grounded claim density
             claim_check = detect_unsupported_claims_deterministic(
                 prediction=generated_answer,
                 contexts=retrieved_contexts,
             )
+            grounded_density = compute_grounded_claim_density(
+                prediction=generated_answer,
+                contexts=retrieved_contexts,
+            )
 
-            # 8. Optional LLM judge evaluation
+            # 8. Citations precision and recall
+            citations_list = [getattr(c, "citation", str(c)) for c in retrieved_contexts]
+            citation_eval = compute_citation_precision_recall(
+                citations=citations_list,
+                retrieved_pages=page_numbers,
+                expected_pages=sample.expected_pages,
+                expected_source=sample.expected_source or sample.document_id,
+            )
+
+            # 9. Optional LLM judge evaluation
             judge_res = None
             if self.llm_judge is not None:
                 judge_res = llm_judge_faithfulness(
@@ -367,22 +436,34 @@ class Evaluator:
                 "generated_answer": generated_answer,
                 "semantic_similarity": sem_sim,
                 "token_f1": tok_f1,
+                "token_precision": tok_prec,
+                "token_recall": tok_rec,
+                "exact_match": exact_match,
+                "rouge_l": rouge_l,
                 "context_coverage": ctx_cov,
                 "is_missing_answer": is_missing,
                 "correct_abstention": correct_abstention,
                 "retrieval_recall": ret_recall,
                 "retrieval_precision": ret_precision,
+                "reciprocal_rank": recip_rank,
+                "hit_rate": hit_rate,
+                "noise_ratio": noise_ratio,
                 "page_coverage": page_cov,
                 "source_match": src_match,
                 "faithfulness_ratio": claim_check["faithfulness_ratio"],
                 "unsupported_sentences": claim_check["unsupported_sentences"],
                 "unsupported_claims": claim_check["unsupported_claims"],
+                "grounded_claim_density": grounded_density,
+                "citation_precision": citation_eval.get("citation_precision"),
+                "citation_recall": citation_eval.get("citation_recall"),
+                "citation_f1": citation_eval.get("citation_f1"),
                 "llm_judge": judge_res,
                 "retrieved_count": len(retrieved_contexts),
                 "source_documents": source_documents,
                 "page_numbers": page_numbers,
                 "retrieval_scores": retrieval_scores,
                 "execution_time_seconds": exec_time,
+                "total_latency_ms": round((exec_time or 0.0) * 1000.0, 2),
             })
 
         # Calculate dataset-wide aggregate metrics
@@ -397,4 +478,144 @@ class Evaluator:
             detailed_results=detailed_results,
             config_snapshot=config_snapshot,
         )
+
+
+def expand_dataset_from_document(
+    document: LoadedDocument,
+    max_samples: int = 10,
+    llm_client: Optional[BaseLLMClient] = None,
+) -> List[EvaluationSample]:
+    """Automatically synthesize new benchmark QA samples from document pages to expand Did.
+
+    Resolves the limitation of very small expert-curated ideal datasets (Did)
+    noted in the ReRAG paper, enabling evaluation on diverse, unseen queries.
+
+    Args:
+        document: Loaded document with extracted pages and content.
+        max_samples: Maximum number of synthetic QA samples to generate.
+        llm_client: Optional LLM client. If None, deterministic sentence extraction is used.
+
+    Returns:
+        List[EvaluationSample]: Synthesized benchmark samples with provenance annotations.
+    """
+    new_samples: List[EvaluationSample] = []
+    doc_id = document.document_id
+
+    for page in document.pages:
+        if len(new_samples) >= max_samples:
+            break
+        text = page.text.strip()
+        if not text or len(text) < 40:
+            continue
+
+        # Extract candidates: sentences with substantive content
+        import re
+        raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) > 35]
+
+        for s_idx, sentence in enumerate(raw_sentences):
+            if len(new_samples) >= max_samples:
+                break
+
+            # Filter trivial or structural headers
+            if sentence.count(" ") < 5:
+                continue
+
+            sample_id = f"{doc_id}_p{page.page_number}_s{s_idx + 1}"
+
+            if llm_client is not None:
+                prompt = (
+                    f"Given the following factual passage from document '{doc_id}', generate one concise factual "
+                    f"question whose answer is directly and solely contained in the statement.\n\n"
+                    f"Passage: \"{sentence}\"\n\n"
+                    f"Output Format:\nQuestion: <question>"
+                )
+                try:
+                    resp = llm_client.generate(prompt=prompt)
+                    line = resp.content.strip().split("\n")[0]
+                    question = line.replace("Question:", "").strip().strip('"')
+                except Exception:
+                    question = f"What does page {page.page_number} state regarding {sentence[:30]}...?"
+            else:
+                # Deterministic synthesis for offline execution
+                clean_frag = sentence.rstrip(".?!")
+                question = f"According to {doc_id} on page {page.page_number}, what is specified about: '{clean_frag[:45]}...'?"
+
+            new_samples.append(
+                EvaluationSample(
+                    sample_id=sample_id,
+                    question=question,
+                    reference_answer=sentence,
+                    expected_source=doc_id,
+                    expected_pages=[page.page_number],
+                    document_id=doc_id,
+                    relevant_doc_ids=[doc_id],
+                    supporting_passages=[sentence],
+                    metadata={"synthetic_expansion": True, "page_number": page.page_number},
+                )
+            )
+
+    logger.info("Synthesized %d expanded benchmark evaluation samples for '%s'.", len(new_samples), doc_id)
+    return new_samples
+
+
+def compute_statistical_significance(
+    baseline_scores: Sequence[float],
+    rerag_scores: Sequence[float],
+) -> Dict[str, Any]:
+    """Compute empirical statistical significance metrics comparing Baseline vs ReRAG.
+
+    Addresses the scientific requirement to test whether hallucination reduction
+    or metric gains are statistically significant on expanded test datasets.
+
+    Args:
+        baseline_scores: Sequence of sample-level scores from baseline single-hop RAG.
+        rerag_scores: Sequence of corresponding sample-level scores from iterative ReRAG.
+
+    Returns:
+        Dict[str, Any]: Statistical summary including mean gain, std err, paired t-stat,
+                        p-value estimate, and 95% confidence intervals.
+    """
+    import math
+
+    if not baseline_scores or not rerag_scores:
+        return {"status": "insufficient_data", "n": 0}
+
+    n = min(len(baseline_scores), len(rerag_scores))
+    if n < 2:
+        return {"status": "insufficient_samples_for_inference", "n": n}
+
+    b = list(baseline_scores[:n])
+    r = list(rerag_scores[:n])
+
+    diffs = [r[i] - b[i] for i in range(n)]
+    mean_diff = sum(diffs) / n
+    variance = sum((d - mean_diff) ** 2 for d in diffs) / (n - 1)
+    std_err = math.sqrt(variance / n) if variance > 0 else 0.0
+
+    if std_err > 1e-8:
+        t_stat = mean_diff / std_err
+        # Normal approximation for two-tailed p-value
+        z = abs(t_stat)
+        # Approximation of standard normal CDF tail: erfc(z / sqrt(2))
+        p_val_approx = math.erfc(z / math.sqrt(2))
+    else:
+        t_stat = 0.0
+        p_val_approx = 1.0 if abs(mean_diff) < 1e-6 else 0.0
+
+    ci_margin = 1.96 * std_err
+
+    return {
+        "status": "computed",
+        "sample_size": n,
+        "mean_baseline": round(sum(b) / n, 4),
+        "mean_rerag": round(sum(r) / n, 4),
+        "mean_improvement": round(mean_diff, 4),
+        "standard_error": round(std_err, 4),
+        "t_statistic": round(t_stat, 4),
+        "p_value_approx": round(p_val_approx, 5),
+        "is_statistically_significant_p05": bool(p_val_approx < 0.05),
+        "ci_95_lower": round(mean_diff - ci_margin, 4),
+        "ci_95_upper": round(mean_diff + ci_margin, 4),
+    }
+
 

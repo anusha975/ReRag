@@ -202,61 +202,6 @@ class DocumentLoader:
                 f"Failed to open PDF document '{path.name}'. File may be corrupt or invalid: {exc}"
             ) from exc
 
-    def _load_pdf_fallback_pypdf(self, path: Path) -> LoadedDocument:
-        """Fallback PDF loader using lightweight pypdf when system memory limits C-library loading."""
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(str(path))
-        except Exception as exc:
-            raise InvalidDocumentError(
-                f"Failed to open PDF document '{path.name}'. File may be corrupt or invalid: {exc}"
-            ) from exc
-
-        total_pages = len(reader.pages)
-        pages: List[PageContent] = []
-        for idx, page in enumerate(reader.pages):
-            try:
-                raw_text = page.extract_text() or ""
-            except Exception:
-                raw_text = ""
-            clean_text = normalize_whitespace(raw_text)
-            has_images = bool(getattr(page, "images", None))
-            pages.append(
-                PageContent(
-                    page_number=idx + 1,
-                    text=clean_text,
-                    char_count=len(clean_text),
-                    has_images=has_images,
-                    needs_ocr=(len(clean_text) == 0 and has_images),
-                )
-            )
-
-        total_chars = sum(p.char_count for p in pages)
-        needs_ocr = total_pages > 0 and total_chars == 0
-        warnings: List[str] = []
-        if needs_ocr:
-            warnings.append(
-                f"Document '{path.name}' contains no extractable text across all {total_pages} page(s)."
-            )
-
-        metadata: Dict[str, Any] = {
-            "source_path": str(path),
-            "filename": path.name,
-            "document_id": path.stem,
-            "format": "PDF",
-            "total_pages": total_pages,
-            "needs_ocr": needs_ocr,
-            "warnings": warnings,
-        }
-        return LoadedDocument(
-            content="\n\n".join(p.text for p in pages if p.text),
-            metadata=metadata,
-            source_path=path,
-            pages=pages,
-            needs_ocr=needs_ocr,
-            warnings=warnings,
-        )
-
         try:
             raw_meta = doc.metadata or {}
             total_pages = len(doc)
@@ -374,6 +319,61 @@ class DocumentLoader:
             ) from exc
         finally:
             doc.close()
+
+    def _load_pdf_fallback_pypdf(self, path: Path) -> LoadedDocument:
+        """Fallback PDF loader using lightweight pypdf when system memory limits C-library loading."""
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+        except Exception as exc:
+            raise InvalidDocumentError(
+                f"Failed to open PDF document '{path.name}'. File may be corrupt or invalid: {exc}"
+            ) from exc
+
+        total_pages = len(reader.pages)
+        pages: List[PageContent] = []
+        for idx, page in enumerate(reader.pages):
+            try:
+                raw_text = page.extract_text() or ""
+            except Exception:
+                raw_text = ""
+            clean_text = normalize_whitespace(raw_text)
+            has_images = bool(getattr(page, "images", None))
+            pages.append(
+                PageContent(
+                    page_number=idx + 1,
+                    text=clean_text,
+                    char_count=len(clean_text),
+                    has_images=has_images,
+                    needs_ocr=(len(clean_text) == 0 and has_images),
+                )
+            )
+
+        total_chars = sum(p.char_count for p in pages)
+        needs_ocr = total_pages > 0 and total_chars == 0
+        warnings: List[str] = []
+        if needs_ocr:
+            warnings.append(
+                f"Document '{path.name}' contains no extractable text across all {total_pages} page(s)."
+            )
+
+        metadata: Dict[str, Any] = {
+            "source_path": str(path),
+            "filename": path.name,
+            "document_id": path.stem,
+            "format": "PDF",
+            "total_pages": total_pages,
+            "needs_ocr": needs_ocr,
+            "warnings": warnings,
+        }
+        return LoadedDocument(
+            content="\n\n".join(p.text for p in pages if p.text),
+            metadata=metadata,
+            source_path=path,
+            pages=pages,
+            needs_ocr=needs_ocr,
+            warnings=warnings,
+        )
 
     def _load_text(self, path: Path) -> LoadedDocument:
         """Load and normalize plain text or markdown files."""

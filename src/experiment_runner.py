@@ -36,7 +36,16 @@ from src.optimizer import (
     ChunkConfig,
     OptimizationObjective,
     OptimizationResult,
+    RandomSearchConfig,
+    RandomSearchOptimizer,
     SearchBounds,
+    SimulatedAnnealingConfig,
+    SimulatedAnnealingOptimizer,
+)
+from src.comparison_runner import (
+    ComparisonMethodResult,
+    ComparisonResult,
+    ComparisonRunner,
 )
 from src.rag_pipeline import RAGPipeline
 from src.retriever import Retriever
@@ -357,3 +366,48 @@ class ExperimentRunner:
             "selected_score": sel_score,
             "held_out_gain": held_out_gain,
         }
+
+    def run_comparative_experiment(
+        self,
+        methods: Sequence[str] = ("fixed", "greedy", "random", "simulated_annealing"),
+        matched_budget: int = 10,
+        baseline_config: Optional[ChunkConfig] = None,
+        search_bounds: Optional[SearchBounds] = None,
+        objective: Optional[OptimizationObjective] = None,
+        save_results: bool = True,
+        experiment_name: Optional[str] = None,
+        progress_callback: Optional[Callable[[str, int, int, Dict[str, Any]], None]] = None,
+    ) -> ComparisonResult:
+        """Run controlled benchmark comparison across optimization strategies.
+
+        Executes fixed-parameter baseline, original ReRAG greedy search, random search,
+        and simulated annealing under identical experimental conditions and evaluates
+        each selected configuration on held-out test data.
+
+        Returns:
+            ComparisonResult: Multi-method comparison outcome and summary tables.
+        """
+        runner = ComparisonRunner(
+            settings=self.settings,
+            documents=self.documents,
+            train_samples=self.train_samples,
+            test_samples=self.test_samples,
+            random_seed=self.random_seed,
+            embedding_manager=self.embedding_manager,
+            llm_client=self.llm_client,
+            pipeline=self.pipeline,
+            evaluator=self.evaluator,
+            collection_name=self.collection_name,
+            results_dir=self.results_dir,
+        )
+        return runner.run_comparison(
+            methods=methods,
+            matched_budget=matched_budget,
+            baseline_config=baseline_config,
+            search_bounds=search_bounds,
+            objective=objective,
+            save_results=save_results,
+            experiment_name=experiment_name,
+            progress_callback=progress_callback,
+        )
+

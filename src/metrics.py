@@ -34,7 +34,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Sequence, Union
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 
@@ -428,6 +430,347 @@ def compute_hallucination_rate(
     return float(np.clip(unsupported_claims / total_claims, 0.0, 1.0))
 
 
+def compute_exact_match(prediction: str, reference: str, normalize: bool = True) -> float:
+    """Compute Exact Match (EM) metric between predicted and reference text.
+
+    Args:
+        prediction: Generated text.
+        reference: Ground truth reference text.
+        normalize: If True, normalizes case, whitespace, articles, and punctuation.
+
+    Returns:
+        float: 1.0 if identical match, 0.0 otherwise.
+    """
+    def _normalize_text(s: str) -> str:
+        s = s.lower().strip()
+        # Remove punctuation
+        s = re.sub(r"[^\w\s]", "", s)
+        # Remove standard English articles
+        s = re.sub(r"\b(a|an|the)\b", " ", s)
+        # Collapse whitespace
+        return " ".join(s.split())
+
+    p = _normalize_text(prediction) if normalize else prediction.strip()
+    r = _normalize_text(reference) if normalize else reference.strip()
+
+    if not p and not r:
+        return 1.0
+    return 1.0 if p == r else 0.0
+
+
+def compute_token_precision_recall(prediction: str, reference: str) -> Tuple[float, float, float]:
+    """Compute unigram token precision, recall, and F1 score.
+
+    Args:
+        prediction: Generated text string.
+        reference: Ground truth text string.
+
+    Returns:
+        Tuple[float, float, float]: (precision, recall, f1)
+    """
+    pred_tokens = _tokenize(prediction)
+    ref_tokens = _tokenize(reference)
+
+    if not pred_tokens or not ref_tokens:
+        is_match = float(pred_tokens == ref_tokens)
+        return is_match, is_match, is_match
+
+    common = Counter(pred_tokens) & Counter(ref_tokens)
+    overlap_count = sum(common.values())
+
+    if overlap_count == 0:
+        return 0.0, 0.0, 0.0
+
+    precision = overlap_count / len(pred_tokens)
+    recall = overlap_count / len(ref_tokens)
+    f1 = 2 * (precision * recall) / (precision + recall)
+    return float(precision), float(recall), float(f1)
+
+
+def compute_rouge_l(prediction: str, reference: str) -> float:
+    """Compute ROUGE-L (Longest Common Subsequence F1) between prediction and reference.
+
+    Calculates the LCS-based F-measure over word tokens, reflecting sentence-level
+    sequence preservation and word order without requiring strict surface match.
+
+    Args:
+        prediction: Generated response string.
+        reference: Reference ground truth string.
+
+    Returns:
+        float: ROUGE-L F1 score between 0.0 and 1.0.
+    """
+    p_tokens = _tokenize(prediction)
+    r_tokens = _tokenize(reference)
+
+    if not p_tokens or not r_tokens:
+        return 1.0 if p_tokens == r_tokens else 0.0
+
+    m, n = len(p_tokens), len(r_tokens)
+    # Dynamic programming matrix for Longest Common Subsequence (LCS)
+    # Using 2-row rolling buffer for memory efficiency
+    prev = [0] * (n + 1)
+    curr = [0] * (n + 1)
+
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if p_tokens[i - 1] == r_tokens[j - 1]:
+                curr[j] = prev[j - 1] + 1
+            else:
+                curr[j] = max(prev[j], curr[j - 1])
+        prev, curr = curr, [0] * (n + 1)
+
+    lcs_len = prev[n]
+    if lcs_len == 0:
+        return 0.0
+
+    prec = lcs_len / m
+    rec = lcs_len / n
+    return float(2 * (prec * rec) / (prec + rec))
+
+
+def compute_reciprocal_rank(
+    retrieved_ids: Sequence[str],
+    relevant_ids: Optional[Sequence[str]],
+    k: int = 4,
+) -> Optional[float]:
+    """Compute Mean Reciprocal Rank (MRR@k) of first relevant retrieved item.
+
+    Args:
+        retrieved_ids: Ordered sequence of retrieved document or chunk IDs.
+        relevant_ids: Set or list of known relevant document IDs.
+        k: Cutoff rank.
+
+    Returns:
+        Optional[float]: Reciprocal rank 1.0 / rank in [0.0, 1.0], or None if relevant_ids is absent.
+    """
+    if relevant_ids is None or len(relevant_ids) == 0:
+        return None
+
+    rel_set = {str(r).strip() for r in relevant_ids if str(r).strip()}
+    if not rel_set:
+        return None
+
+    cutoff = max(1, k)
+    for rank, item_id in enumerate(retrieved_ids[:cutoff], start=1):
+        if str(item_id).strip() in rel_set:
+            return float(1.0 / rank)
+    return 0.0
+
+
+def compute_hit_rate_at_k(
+    retrieved_ids: Sequence[str],
+    relevant_ids: Optional[Sequence[str]],
+    k: int = 4,
+) -> Optional[float]:
+    """Compute Hit Rate@k (whether at least one relevant item was retrieved in top-k).
+
+    Args:
+        retrieved_ids: Ordered sequence of retrieved IDs.
+        relevant_ids: Ground truth relevant IDs.
+        k: Cutoff rank.
+
+    Returns:
+        Optional[float]: 1.0 if hit, 0.0 if miss, None if relevant_ids is unavailable.
+    """
+    if relevant_ids is None or len(relevant_ids) == 0:
+        return None
+
+    rel_set = {str(r).strip() for r in relevant_ids if str(r).strip()}
+    if not rel_set:
+        return None
+
+    top_k_set = {str(i).strip() for i in retrieved_ids[:max(1, k)]}
+    return 1.0 if bool(rel_set & top_k_set) else 0.0
+
+
+def compute_noise_ratio(
+    retrieved_ids: Sequence[str],
+    relevant_ids: Optional[Sequence[str]],
+    k: int = 4,
+) -> Optional[float]:
+    """Compute the noise ratio of retrieved items (fraction of top-k items that are non-relevant).
+
+    Args:
+        retrieved_ids: Ordered sequence of retrieved IDs.
+        relevant_ids: Known relevant IDs.
+        k: Cutoff rank.
+
+    Returns:
+        Optional[float]: Noise ratio in [0.0, 1.0], or None if relevant_ids is unavailable.
+    """
+    prec = compute_retrieval_precision_at_k(retrieved_ids, relevant_ids, k)
+    if prec is None:
+        return None
+    return float(max(0.0, 1.0 - prec))
+
+
+def compute_citation_precision_recall(
+    citations: Sequence[str],
+    retrieved_pages: Sequence[int],
+    expected_pages: Optional[Sequence[int]] = None,
+    expected_source: Optional[Union[str, Sequence[str]]] = None,
+) -> Dict[str, Optional[float]]:
+    """Compute citation precision, recall, and F1 against retrieved evidence and expected ground truth.
+
+    Args:
+        citations: List of citation strings in the prediction (e.g. ['[Doc, p. 1]']).
+        retrieved_pages: Pages from which passages were actually retrieved.
+        expected_pages: Ground-truth expected pages from benchmark.
+        expected_source: Expected ground-truth document ID.
+
+    Returns:
+        Dict[str, Optional[float]]: citation_precision, citation_recall, citation_f1.
+    """
+    if not citations:
+        if expected_pages:
+            return {"citation_precision": 0.0, "citation_recall": 0.0, "citation_f1": 0.0}
+        return {"citation_precision": 1.0, "citation_recall": 1.0, "citation_f1": 1.0}
+
+    # Extract page numbers cited in text: e.g. p. 1 or pp. 1-2
+    cited_pages: Set[int] = set()
+    for c in citations:
+        matches = re.findall(r"\bp(?:p)?\.\s*(\d+)(?:-(\d+))?", str(c))
+        for m in matches:
+            if m[0]:
+                start_p = int(m[0])
+                end_p = int(m[1]) if m[1] else start_p
+                for p in range(start_p, end_p + 1):
+                    cited_pages.add(p)
+
+    target_pages = set(expected_pages) if expected_pages else set(retrieved_pages)
+
+    if not target_pages:
+        return {"citation_precision": None, "citation_recall": None, "citation_f1": None}
+
+    if not cited_pages:
+        return {"citation_precision": 0.0, "citation_recall": 0.0, "citation_f1": 0.0}
+
+    matched = cited_pages & target_pages
+    precision = len(matched) / len(cited_pages)
+    recall = len(matched) / len(target_pages)
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {
+        "citation_precision": float(precision),
+        "citation_recall": float(recall),
+        "citation_f1": float(f1),
+    }
+
+
+def compute_grounded_claim_density(
+    prediction: str,
+    contexts: Sequence[Any],
+) -> float:
+    """Compute density of grounded claims per 100 words in the prediction.
+
+    Args:
+        prediction: Generated answer text.
+        contexts: Sequence of retrieved contexts.
+
+    Returns:
+        float: Grounded claims per 100 words.
+    """
+    check = detect_unsupported_claims_deterministic(prediction, contexts)
+    words = _tokenize(prediction)
+    word_count = len(words)
+    if word_count == 0:
+        return 0.0
+    supported_sentences = check.get("supported_sentences", 0)
+    return float((supported_sentences / word_count) * 100.0)
+
+
+def compute_latency_metrics(
+    retrieval_seconds: float,
+    generation_seconds: float,
+    total_seconds: Optional[float] = None,
+) -> Dict[str, float]:
+    """Calculate granular latency metrics in milliseconds.
+
+    Args:
+        retrieval_seconds: ChromaDB retrieval duration in seconds.
+        generation_seconds: LLM grounded generation & verification duration in seconds.
+        total_seconds: Total pipeline wall clock duration.
+
+    Returns:
+        Dict[str, float]: Granular latency metrics in milliseconds.
+    """
+    tot = total_seconds if total_seconds is not None else (retrieval_seconds + generation_seconds)
+    return {
+        "retrieval_latency_ms": round(retrieval_seconds * 1000.0, 2),
+        "generation_latency_ms": round(generation_seconds * 1000.0, 2),
+        "total_latency_ms": round(tot * 1000.0, 2),
+        "retrieval_fraction": round(retrieval_seconds / max(1e-6, tot), 4),
+    }
+
+
+@dataclass
+class OptimizationCostTracker:
+    """Tracks computational effort and resource expenditure during parameter optimization."""
+
+    total_trials: int = 0
+    accepted_trials: int = 0
+    chunks_indexed: int = 0
+    embedding_queries_count: int = 0
+    embedding_texts_count: int = 0
+    llm_calls_count: int = 0
+    wall_clock_seconds: float = 0.0
+    cache_hits: int = 0
+    cache_misses: int = 0
+
+    def record_trial(
+        self,
+        trial_chunks: int = 0,
+        trial_queries: int = 0,
+        trial_llm_calls: int = 0,
+        trial_time_seconds: float = 0.0,
+        was_accepted: bool = False,
+        cache_hit: bool = False,
+    ) -> None:
+        """Record resource usage of a candidate trial."""
+        self.total_trials += 1
+        if was_accepted:
+            self.accepted_trials += 1
+        if cache_hit:
+            self.cache_hits += 1
+        else:
+            self.cache_misses += 1
+            self.chunks_indexed += trial_chunks
+            self.embedding_texts_count += trial_chunks
+            self.embedding_queries_count += trial_queries
+            self.llm_calls_count += trial_llm_calls
+
+        self.wall_clock_seconds += trial_time_seconds
+
+    @property
+    def estimated_cost_proxy(self) -> float:
+        """Transparent compute cost proxy score (arbitrary standardized units).
+
+        Formula:
+          cost = 0.001 * chunks_indexed + 0.005 * llm_calls + 0.01 * wall_clock_seconds
+        """
+        return round(
+            0.001 * self.chunks_indexed + 0.005 * self.llm_calls_count + 0.01 * self.wall_clock_seconds,
+            4,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert cost tracker to structured dictionary."""
+        return {
+            "total_trials": self.total_trials,
+            "accepted_trials": self.accepted_trials,
+            "chunks_indexed": self.chunks_indexed,
+            "embedding_queries_count": self.embedding_queries_count,
+            "embedding_texts_count": self.embedding_texts_count,
+            "llm_calls_count": self.llm_calls_count,
+            "wall_clock_seconds": round(self.wall_clock_seconds, 3),
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_rate": round(self.cache_hits / max(1, self.total_trials), 4),
+            "estimated_cost_proxy": self.estimated_cost_proxy,
+        }
+
+
 def compute_aggregate_metrics(per_question_results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Calculate aggregate summary metrics across all evaluated questions.
 
@@ -452,6 +795,15 @@ def compute_aggregate_metrics(per_question_results: Sequence[Dict[str, Any]]) ->
             "mean_source_match": None,
             "mean_faithfulness_ratio": None,
             "abstention_rate": None,
+            "mean_exact_match": None,
+            "mean_rouge_l": None,
+            "mean_reciprocal_rank": None,
+            "mean_hit_rate": None,
+            "mean_noise_ratio": None,
+            "mean_token_precision": None,
+            "mean_token_recall": None,
+            "mean_grounded_claim_density": None,
+            "mean_latency_ms": None,
         }
 
     def _mean_valid(key: str) -> Optional[float]:
@@ -474,5 +826,15 @@ def compute_aggregate_metrics(per_question_results: Sequence[Dict[str, Any]]) ->
         "mean_source_match": _mean_valid("source_match"),
         "mean_faithfulness_ratio": _mean_valid("faithfulness_ratio"),
         "abstention_rate": abstention_rate,
+        "mean_exact_match": _mean_valid("exact_match"),
+        "mean_rouge_l": _mean_valid("rouge_l"),
+        "mean_reciprocal_rank": _mean_valid("reciprocal_rank"),
+        "mean_hit_rate": _mean_valid("hit_rate"),
+        "mean_noise_ratio": _mean_valid("noise_ratio"),
+        "mean_token_precision": _mean_valid("token_precision"),
+        "mean_token_recall": _mean_valid("token_recall"),
+        "mean_grounded_claim_density": _mean_valid("grounded_claim_density"),
+        "mean_latency_ms": _mean_valid("total_latency_ms"),
     }
+
 
