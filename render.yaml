@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: rerag-research-platform
+    runtime: python
+    plan: free
+    buildCommand: "pip install --upgrade pip && pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt"
+    startCommand: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: ENVIRONMENT
+        value: production
+      - key: DEVICE
+        value: cpu
+      - key: CHROMA_PERSIST_DIR
+        value: data/chroma_db
+      - key: RETRIEVAL_TOP_K
+        value: "4"
+      - key: VERIFICATION_THRESHOLD
+        value: "0.7"
+      - key: OLLAMA_BASE_URL
+        sync: false # Set in Render Dashboard: point to your remote Ollama / Ngrok URL
