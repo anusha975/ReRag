@@ -433,4 +433,12 @@ pytest tests/ -v
 python scripts/run_comparison_study.py --budget 6 --seed 42 --dataset data/evaluation/expert_qa_dataset.json --document data/documents/ReRAG_Test_Knowledge_Document.pdf
 ```
 
+### 6. Cloud Deployment (Render)
+This repository includes native Render Blueprint configuration for zero-setup cloud deployment:
+1. Log in to [Render Dashboard](https://dashboard.render.com/) and click **New +** -> **Blueprint**.
+2. Connect repository `anusha975/ReRag`.
+3. Render automatically detects [`render.yaml`](render.yaml), sets Python 3.11, installs CPU-only PyTorch, and provisions the live Streamlit web service.
+4. The application seamlessly supports built-in **Offline / Mock LLM Mode** for live browser evaluation without local GPU constraints, or can connect to an external Ollama endpoint via `OLLAMA_BASE_URL`.
+
+
 
