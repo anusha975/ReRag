@@ -16,9 +16,15 @@ if Path(r"D:\hf_cache").exists():
     os.environ["TRANSFORMERS_CACHE"] = r"D:\hf_cache\hub"
     os.environ["SENTENCE_TRANSFORMERS_HOME"] = r"D:\hf_cache"
 
+import sys
+
 if Path(r"D:\pip-temp").exists():
     os.environ["TEMP"] = r"D:\pip-temp"
     os.environ["TMP"] = r"D:\pip-temp"
+
+_SITE_PACKAGES_313 = Path(r"C:\Users\DELL\AppData\Local\Programs\Python\Python313\Lib\site-packages")
+if _SITE_PACKAGES_313.exists() and str(_SITE_PACKAGES_313) not in sys.path:
+    sys.path.append(str(_SITE_PACKAGES_313))
 
 
 class DeterministicMockEmbeddingManager:

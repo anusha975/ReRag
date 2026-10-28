@@ -10,10 +10,14 @@ import logging
 import sys
 from pathlib import Path
 
-# Add project root to sys.path
+# Add project root and local Python 3.13 site-packages to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+_SITE_PACKAGES_313 = Path(r"C:\Users\DELL\AppData\Local\Programs\Python\Python313\Lib\site-packages")
+if _SITE_PACKAGES_313.exists() and str(_SITE_PACKAGES_313) not in sys.path:
+    sys.path.append(str(_SITE_PACKAGES_313))
 
 from src.config import get_settings, setup_logging
 from ui.dashboard import render_dashboard
