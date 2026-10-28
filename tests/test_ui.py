@@ -201,7 +201,8 @@ def test_get_llm_client_offline_and_online():
 
 def test_streamlit_app_navigation():
     """Verify headless execution and section navigation across the entire dashboard."""
-    at = AppTest.from_file("app.py", default_timeout=45)
+    app_path = Path(__file__).parent.parent / "app.py"
+    at = AppTest.from_file(str(app_path), default_timeout=45)
     at.run()
     assert not at.exception, f"App execution raised exception: {at.exception}"
 
@@ -211,6 +212,10 @@ def test_streamlit_app_navigation():
 
     # Verify Section 1: Document Workspace renders
     assert "Document Workspace" in nav_radio.value
+
+    # Navigate to Section 1B: QA Dataset Lab
+    nav_radio.set_value("📚 QA Dataset Lab").run()
+    assert not at.exception, f"QA Dataset Lab raised exception: {at.exception}"
 
     # Navigate to Section 2: RAG Chat
     nav_radio.set_value("💬 RAG Chat").run()
@@ -223,6 +228,10 @@ def test_streamlit_app_navigation():
     # Navigate to Section 4: Results and Comparison
     nav_radio.set_value("📊 Results and Comparison").run()
     assert not at.exception, f"Results and Comparison raised exception: {at.exception}"
+
+    # Navigate to Section 5: Experiment History
+    nav_radio.set_value("📜 Experiment History").run()
+    assert not at.exception, f"Experiment History raised exception: {at.exception}"
 
     # Navigate to Section 5: Experiment History
     nav_radio.set_value("📜 Experiment History").run()

@@ -838,3 +838,138 @@ def compute_aggregate_metrics(per_question_results: Sequence[Dict[str, Any]]) ->
     }
 
 
+# ==============================================================================
+# METRIC SCIENTIFIC CATEGORIES & TRANSPARENCY REGISTRY
+# ==============================================================================
+
+METRIC_METADATA_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "semantic_similarity": {
+        "category": "neural_proxy",
+        "display_name": "Semantic Similarity (Cosine)",
+        "is_proxy": True,
+        "description": "Dense embedding cosine similarity using SentenceTransformers. Measures topical/stylistic alignment; NOT direct evidence of factual correctness.",
+        "requires_annotations": ["reference_answer"],
+    },
+    "token_f1": {
+        "category": "deterministic",
+        "display_name": "Token-Level F1 Score",
+        "is_proxy": False,
+        "description": "Harmonic mean of unigram lexical precision and recall against reference answer. Strict and deterministic.",
+        "requires_annotations": ["reference_answer"],
+    },
+    "rouge_l": {
+        "category": "deterministic",
+        "display_name": "ROUGE-L Score",
+        "is_proxy": False,
+        "description": "Longest common subsequence F1 score between prediction and human reference text.",
+        "requires_annotations": ["reference_answer"],
+    },
+    "exact_match": {
+        "category": "deterministic",
+        "display_name": "Exact Match (EM)",
+        "is_proxy": False,
+        "description": "Binary 1.0/0.0 indicator of exact string equality after whitespace and case normalization.",
+        "requires_annotations": ["reference_answer"],
+    },
+    "retrieval_recall": {
+        "category": "deterministic",
+        "display_name": "Retrieval Recall@k",
+        "is_proxy": False,
+        "description": "Fraction of ground-truth annotated source documents/pages retrieved within top-k cutoff. Unavailable ('Not available') if ground-truth provenance is unannotated.",
+        "requires_annotations": ["expected_pages", "expected_source"],
+    },
+    "retrieval_precision": {
+        "category": "deterministic",
+        "display_name": "Retrieval Precision@k",
+        "is_proxy": False,
+        "description": "Fraction of retrieved top-k passages that originate from annotated ground-truth source documents.",
+        "requires_annotations": ["expected_pages", "expected_source"],
+    },
+    "context_coverage": {
+        "category": "deterministic",
+        "display_name": "Context Coverage Ratio",
+        "is_proxy": True,
+        "description": "Lexical overlap ratio of predicted tokens found in retrieved context passages. Lexical proxy for grounding.",
+        "requires_annotations": [],
+    },
+    "faithfulness_ratio": {
+        "category": "neural_proxy",
+        "display_name": "Groundedness / Faithfulness",
+        "is_proxy": True,
+        "description": "Ratio of extracted answer sentences supported by retrieved context passages according to verification step.",
+        "requires_annotations": [],
+    },
+    "hallucination_rate": {
+        "category": "neural_proxy",
+        "display_name": "Unsupported Claim Rate",
+        "is_proxy": True,
+        "description": "Heuristic rate of candidate claims lacking passage evidence (1.0 - faithfulness_ratio).",
+        "requires_annotations": [],
+    },
+    "total_latency_ms": {
+        "category": "system_performance",
+        "display_name": "End-to-End Latency (ms)",
+        "is_proxy": False,
+        "description": "Clock time in milliseconds required for query embedding, vector retrieval, and LLM synthesis.",
+        "requires_annotations": [],
+    },
+    "mean_semantic_similarity": {
+        "category": "neural_proxy",
+        "display_name": "Mean Semantic Similarity (Cosine)",
+        "is_proxy": True,
+        "description": "Dense embedding cosine similarity using SentenceTransformers. Measures topical/stylistic alignment; NOT direct evidence of factual correctness.",
+        "requires_annotations": ["reference_answer"],
+    },
+    "mean_faithfulness_ratio": {
+        "category": "deterministic",
+        "display_name": "Mean Faithfulness Ratio",
+        "is_proxy": False,
+        "description": "Ratio of extracted answer sentences supported by retrieved context passages according to verification step.",
+        "requires_annotations": [],
+    },
+    "mean_groundedness": {
+        "category": "llm_judge",
+        "display_name": "Mean Groundedness (LLM Judge)",
+        "is_proxy": True,
+        "description": "LLM-as-a-judge score rating alignment between claims and retrieved context.",
+        "requires_annotations": [],
+    },
+    "mean_latency_seconds": {
+        "category": "system_performance",
+        "display_name": "Mean Latency (s)",
+        "is_proxy": False,
+        "description": "Average response latency in seconds.",
+        "requires_annotations": [],
+    },
+}
+
+
+def format_metric_value(
+    value: Optional[Union[float, int, str]],
+    precision: Union[int, str] = 4,
+    as_percentage: bool = False,
+) -> str:
+    """Format evaluation metric value for UI and reports.
+
+    Returns 'Not available' for None or NaN values rather than manufacturing or substituting a score.
+    """
+    import math
+
+    if value is None:
+        return "Not available"
+    try:
+        val_float = float(value)
+        if math.isnan(val_float) or math.isinf(val_float):
+            return "Not available"
+        if isinstance(precision, str):
+            # e.g. ".2f"
+            fmt = f"{{{precision}}}"
+            return fmt.format(val_float)
+        if as_percentage:
+            return f"{val_float * 100:.{max(0, precision - 2)}f}%"
+        return f"{val_float:.{precision}f}"
+    except (ValueError, TypeError):
+        return str(value)
+
+
+

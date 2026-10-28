@@ -160,6 +160,13 @@ class EmbeddingManager:
                 _MODEL_CACHE[cache_key] = model
             return _MODEL_CACHE[cache_key]
 
+    def warmup(self) -> None:
+        """Eagerly load the neural embedding model into memory to eliminate first-request latency."""
+        try:
+            self._get_model()
+        except Exception as exc:
+            logger.warning("Embedding warmup encountered exception: %s", exc)
+
     @property
     def embedding_dim(self) -> int:
         """Return the dimensionality of the generated dense embedding vectors."""

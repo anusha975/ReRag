@@ -67,6 +67,8 @@ class EvaluationSample:
     expected_citations: Optional[List[int]] = None
     difficulty: Optional[str] = None
     is_negative: Optional[bool] = None
+    annotation_status: str = "verified_expert"
+    topic: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Harmonize legacy field aliases and metadata."""
@@ -80,8 +82,16 @@ class EvaluationSample:
             self.expected_pages = self.expected_citations
         if self.difficulty and "difficulty" not in self.metadata:
             self.metadata["difficulty"] = self.difficulty
+        if self.topic and "topic" not in self.metadata:
+            self.metadata["topic"] = self.topic
+        elif not self.topic and "topic" in self.metadata:
+            self.topic = str(self.metadata["topic"])
         if self.is_negative is not None and "is_abstention_case" not in self.metadata:
             self.metadata["is_abstention_case"] = self.is_negative
+        if "annotation_status" not in self.metadata:
+            self.metadata["annotation_status"] = self.annotation_status
+        else:
+            self.annotation_status = str(self.metadata["annotation_status"])
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> EvaluationSample:
@@ -97,6 +107,14 @@ class EvaluationSample:
         if isinstance(pages, int):
             pages = [pages]
 
+        ann_status = (
+            data.get("annotation_status")
+            or (data.get("metadata", {}).get("annotation_status") if isinstance(data.get("metadata"), dict) else None)
+            or "verified_expert"
+        )
+        topic_val = data.get("topic") or (data.get("metadata", {}).get("topic") if isinstance(data.get("metadata"), dict) else None)
+        diff_val = data.get("difficulty") or (data.get("metadata", {}).get("difficulty") if isinstance(data.get("metadata"), dict) else None)
+
         return cls(
             sample_id=str(data.get("sample_id") or data.get("id") or "sample"),
             question=str(data.get("question", "")).strip(),
@@ -106,6 +124,9 @@ class EvaluationSample:
             document_id=str(doc_id) if doc_id else None,
             relevant_doc_ids=rel_ids,
             supporting_passages=data.get("supporting_passages"),
+            difficulty=str(diff_val) if diff_val else None,
+            annotation_status=str(ann_status),
+            topic=str(topic_val) if topic_val else None,
             metadata=data.get("metadata", {}),
         )
 
@@ -120,6 +141,9 @@ class EvaluationSample:
             "document_id": self.document_id,
             "relevant_doc_ids": self.relevant_doc_ids,
             "supporting_passages": self.supporting_passages,
+            "difficulty": self.difficulty,
+            "annotation_status": self.annotation_status,
+            "topic": self.topic,
             "metadata": self.metadata,
         }
 

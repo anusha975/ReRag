@@ -25,7 +25,20 @@ import streamlit as st
 from src.chunker import TextChunk, TextChunker
 from src.comparison_runner import ComparisonMethodResult, ComparisonResult, ComparisonRunner
 from src.config import Settings, get_settings
-from src.dataset_workflow import DatasetSplits, DatasetValidator, split_train_val_test
+from src.dataset_workflow import (
+    DatasetSplits,
+    DatasetStatistics,
+    DatasetValidator,
+    DatasetValidationResult,
+    audit_split_leakage,
+    compute_dataset_statistics,
+    export_dataset_to_csv,
+    export_dataset_to_json,
+    load_dataset_from_csv,
+    load_dataset_from_json,
+    split_train_val_test,
+    split_train_val_test_leakage_resistant,
+)
 from src.document_loader import (
     DocumentExtractionError,
     DocumentLoader,
@@ -38,12 +51,16 @@ from src.embeddings import EmbeddingManager
 from src.evaluator import EvaluationReport, EvaluationSample, Evaluator, load_dataset, split_train_test
 from src.experiment_runner import ExperimentRunner
 from src.llm import BaseLLMClient, MockLLMClient, OllamaClient
+from src.metrics import METRIC_METADATA_REGISTRY, format_metric_value
 from src.optimizer import (
     AdaptiveChunkOptimizer,
     AdaptiveSearchConfig,
     CandidateTrial,
     ChunkConfig,
     ChunkOptimizerFactory,
+    FixedConfigOptimizer,
+    GeneralizationAwareConfig,
+    GeneralizationAwareOptimizer,
     OptimizationObjective,
     OptimizationResult,
     RandomSearchConfig,
@@ -78,7 +95,9 @@ logger = logging.getLogger(__name__)
 @st.cache_resource(show_spinner=False)
 def get_shared_embedding_manager() -> EmbeddingManager:
     """Load and cache the shared SentenceTransformer embedding model."""
-    return EmbeddingManager()
+    mgr = EmbeddingManager()
+    mgr.warmup()
+    return mgr
 
 
 def init_session_state(settings: Settings) -> None:
@@ -107,12 +126,28 @@ def init_session_state(settings: Settings) -> None:
         st.session_state.active_collection = settings.vector_store.collection_name
     if "rag_query_input" not in st.session_state:
         st.session_state.rag_query_input = ""
+    if "last_index_notice" not in st.session_state:
+        st.session_state.last_index_notice = None
+    if "active_dataset_samples" not in st.session_state:
+        st.session_state.active_dataset_samples = None
+    if "active_dataset_name" not in st.session_state:
+        st.session_state.active_dataset_name = None
+    if "active_dataset_splits" not in st.session_state:
+        st.session_state.active_dataset_splits = None
+    if "split_leakage_audit" not in st.session_state:
+        st.session_state.split_leakage_audit = None
 
     # Vector store & retriever in session (lazy initialization on first use)
     if "vector_store" not in st.session_state:
         st.session_state.vector_store = None
     if "retriever" not in st.session_state:
         st.session_state.retriever = None
+
+    # Start non-blocking background model warm-up so embedding model is ready in RAM
+    if "warmup_started" not in st.session_state:
+        st.session_state.warmup_started = True
+        import threading
+        threading.Thread(target=get_shared_embedding_manager, daemon=True).start()
 
 
 def get_vector_store(settings: Settings) -> VectorStore:
@@ -269,6 +304,7 @@ def render_document_workspace(settings: Settings) -> None:
                 loader = DocumentLoader()
                 loaded_doc = loader.load_file(target_file_path)
                 st.session_state.loaded_document = loaded_doc
+                st.session_state.last_index_notice = None
                 st.success(f"Successfully loaded '{target_file_path.name}' ({loaded_doc.total_pages} pages).")
             except (DocumentNotFoundError, InvalidDocumentError, DocumentExtractionError, DocumentLoaderError) as exc:
                 st.error(f"Extraction Error: {exc}")
@@ -340,9 +376,15 @@ def render_document_workspace(settings: Settings) -> None:
             return
 
         # Preview & Indexing Buttons
+        is_already_indexed = (
+            st.session_state.indexed_document_id == doc.document_id
+            and st.session_state.indexed_chunks_count > 0
+        )
+        button_label = "🔄 Re-Index into Vector Store" if is_already_indexed else "🚀 Index into Vector Store"
+
         b_col1, b_col2 = st.columns([2, 4])
         with b_col1:
-            index_btn = st.button("🚀 Index into Vector Store", type="primary", use_container_width=True)
+            index_btn = st.button(button_label, type="primary", use_container_width=True)
 
         # Chunker generation
         chunker = TextChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap, unit=chunk_unit)
@@ -351,8 +393,11 @@ def render_document_workspace(settings: Settings) -> None:
         with b_col2:
             st.caption(f"Configured strategy produces **{len(preview_chunks)} chunks** from the active document.")
 
+        if st.session_state.get("last_index_notice"):
+            st.success(st.session_state["last_index_notice"])
+
         if index_btn:
-            with st.spinner("Computing embeddings and indexing into ChromaDB..."):
+            with st.spinner("Computing neural embeddings & indexing chunks into ChromaDB..."):
                 t_idx0 = time.perf_counter()
                 vs: VectorStore = get_vector_store(settings)
                 vs.add_chunks(preview_chunks, prevent_stale=True)
@@ -360,9 +405,8 @@ def render_document_workspace(settings: Settings) -> None:
 
                 st.session_state.indexed_document_id = doc.document_id
                 st.session_state.indexed_chunks_count = len(preview_chunks)
-
-                st.success(
-                    f"Successfully indexed {len(preview_chunks)} chunks into collection "
+                st.session_state.last_index_notice = (
+                    f"✅ Successfully indexed {len(preview_chunks)} chunks into collection "
                     f"'{vs.collection_name}' in {elapsed_idx:.2f}s."
                 )
                 st.rerun()
@@ -392,6 +436,363 @@ def render_document_workspace(settings: Settings) -> None:
                     st.markdown(f"**Source Page:** `{p_num if p_num is not None else 'N/A'}`")
                     st.markdown(f"**Offsets:** `[{chk.metadata.get('start_char', 0)}:{chk.metadata.get('end_char', 0)}]`")
                     st.markdown(f"> {chk.text}")
+
+
+# ==============================================================================
+# SECTION 1B: EXPANDED EXPERT-ANNOTATED QA DATASET LAB
+# ==============================================================================
+
+
+def render_qa_dataset_lab(settings: Settings) -> None:
+    """Render the Expanded Expert-Annotated QA Dataset Management & Splitting Lab.
+
+    Provides:
+    1. Dataset upload & resolution (CSV and JSON formats).
+    2. Data validation: flags missing answers, duplicate questions, and invalid document IDs.
+    3. Annotation status inspection: verified expert answers vs. unverified synthetic vs. reviewed.
+    4. Dataset summary statistics (questions, documents, topics, verified answers).
+    5. Interactive QA pair viewer, editor, and creator.
+    6. Leakage-resistant dataset splitting (near-duplicate grouping, document-level, stratified).
+    7. Split leakage audit verifying that held-out test answers never leak into training.
+    8. Dataset and split exports in CSV and JSON formats.
+    """
+    st.markdown("## 📚 QA Dataset Lab")
+    st.markdown(
+        "Manage expert-annotated QA datasets, validate data integrity, inspect annotation status, "
+        "and configure leakage-resistant partitions (Optimization / Validation / Held-Out Test). "
+        "Ensures strict scientific rigor with zero leakage into the optimization loop."
+    )
+
+    eval_dir = settings.paths.evaluation_dir
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    dataset_files = sorted(list(eval_dir.glob("*.json")) + list(eval_dir.glob("*.csv")))
+
+    # 1. Dataset Selection / Upload Section
+    tab_select, tab_upload = st.tabs(["📁 Active Dataset Selection", "📤 Upload New Dataset"])
+
+    with tab_select:
+        c_sel1, c_sel2 = st.columns([3, 1])
+        with c_sel1:
+            selected_file = st.selectbox(
+                "Select QA Benchmark Dataset:",
+                options=dataset_files,
+                format_func=lambda p: p.name,
+                key="qa_lab_selected_file",
+            )
+        with c_sel2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🔄 Reload File", use_container_width=True):
+                st.session_state.active_dataset_samples = None
+                st.rerun()
+
+    with tab_upload:
+        uploaded_file = st.file_uploader(
+            "Upload QA Dataset (.json or .csv):",
+            type=["json", "csv"],
+            help="Upload a dataset of question-answer pairs with document references and topics.",
+        )
+        if uploaded_file is not None:
+            save_name = uploaded_file.name
+            target_path = eval_dir / save_name
+            if st.button(f"💾 Save and Load `{save_name}`", type="primary"):
+                with open(target_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                st.success(f"Uploaded and saved `{save_name}` to {eval_dir}!")
+                st.session_state.active_dataset_samples = None
+                st.session_state.active_dataset_name = save_name
+                st.rerun()
+
+    # Load active dataset samples
+    if selected_file and (st.session_state.active_dataset_samples is None or st.session_state.active_dataset_name != selected_file.name):
+        try:
+            if selected_file.suffix.lower() == ".csv":
+                samples = load_dataset_from_csv(selected_file)
+            else:
+                samples = load_dataset_from_json(selected_file)
+            st.session_state.active_dataset_samples = samples
+            st.session_state.active_dataset_name = selected_file.name
+        except Exception as exc:
+            st.error(f"Failed to load dataset `{selected_file.name}`: {exc}")
+            return
+
+    samples = st.session_state.active_dataset_samples
+    if not samples:
+        st.info("No QA records loaded. Please select or upload a dataset.")
+        return
+
+    # 2. Dataset Validation & Statistics Card
+    stats = compute_dataset_statistics(samples)
+    val_res = DatasetValidator.validate_samples(samples)
+
+    st.markdown("### 📊 Dataset Integrity & Verification Statistics")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    with m1:
+        st.metric("Total Questions", stats.total_questions)
+    with m2:
+        st.metric("Verified Expert", stats.verified_expert_count, help="Manually verified gold reference answers.")
+    with m3:
+        st.metric("Unreviewed Synthetic", stats.unverified_synthetic_count, help="Automatically generated questions awaiting review.")
+    with m4:
+        st.metric("Reviewed", stats.reviewed_count, help="Human-inspected QA pairs.")
+    with m5:
+        st.metric("Documents", stats.unique_documents)
+    with m6:
+        dup_flag = stats.near_duplicate_count + stats.duplicate_questions_count
+        st.metric("Duplicate Warnings", dup_flag, help="Exact duplicates and near-duplicate pairs (Jaccard similarity >= 0.85)")
+
+    if not val_res.is_valid:
+        st.error(f"⚠️ **Dataset Schema Validation Errors Found:** {', '.join(val_res.errors)}")
+    elif val_res.duplicate_questions:
+        with st.expander(f"⚠️ {len(val_res.duplicate_questions)} Duplicate / Near-Duplicate Warnings Detected (Click to Inspect)"):
+            for dup_msg in val_res.duplicate_questions:
+                st.markdown(f"- {dup_msg}")
+            st.caption("Tip: Use the 'near_duplicate_grouped' split strategy below to keep these pairs within the same partition.")
+
+    # 3. Interactive QA Explorer & Reviewer
+    st.markdown("---")
+    st.markdown("### 🔍 QA Pair Explorer & Review Editor")
+
+    f1, f2, f3, f4 = st.columns([2, 1, 1, 2])
+    with f1:
+        filter_topic = st.selectbox("Filter Topic:", ["All"] + sorted(list(stats.topics)))
+    with f2:
+        filter_diff = st.selectbox("Filter Difficulty:", ["All"] + sorted(list(stats.difficulties)))
+    with f3:
+        filter_status = st.selectbox("Filter Status:", ["All", "verified_expert", "unverified_synthetic", "reviewed"])
+    with f4:
+        search_query = st.text_input("Search Question:", placeholder="Filter by question keyword...")
+
+    filtered_samples = samples
+    if filter_topic != "All":
+        filtered_samples = [s for s in filtered_samples if s.topic == filter_topic]
+    if filter_diff != "All":
+        filtered_samples = [s for s in filtered_samples if s.difficulty == filter_diff]
+    if filter_status != "All":
+        filtered_samples = [s for s in filtered_samples if s.annotation_status == filter_status]
+    if search_query.strip():
+        q_lower = search_query.strip().lower()
+        filtered_samples = [s for s in filtered_samples if q_lower in s.question.lower()]
+
+    st.caption(f"Showing {len(filtered_samples)} of {len(samples)} QA pairs:")
+
+    # Table preview
+    preview_rows = []
+    for s in filtered_samples:
+        preview_rows.append({
+            "Sample ID": s.sample_id,
+            "Question": s.question,
+            "Reference Answer": s.reference_answer[:80] + ("..." if len(s.reference_answer) > 80 else ""),
+            "Document ID": s.document_id or "—",
+            "Topic": s.topic or "—",
+            "Difficulty": s.difficulty or "—",
+            "Annotation Status": s.annotation_status,
+        })
+    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+    # QA Editor / Review Modal in Expander
+    with st.expander("✏️ Edit / Review Selected QA Pair"):
+        if filtered_samples:
+            edit_sample_id = st.selectbox("Select Sample ID to Review/Edit:", options=[s.sample_id for s in filtered_samples])
+            target_sample = next(s for s in filtered_samples if s.sample_id == edit_sample_id)
+
+            e_col1, e_col2 = st.columns(2)
+            with e_col1:
+                new_q = st.text_area("Question Text:", value=target_sample.question, height=70)
+                new_doc = st.text_input("Document ID:", value=target_sample.document_id or "")
+                new_topic = st.text_input("Topic:", value=target_sample.topic or "general")
+            with e_col2:
+                new_ans = st.text_area("Reference Answer:", value=target_sample.reference_answer, height=70)
+                new_diff = st.selectbox("Difficulty:", ["easy", "medium", "hard"], index=["easy", "medium", "hard"].index(target_sample.difficulty or "medium"))
+                status_opts = ["verified_expert", "reviewed", "unverified_synthetic"]
+                curr_status_idx = status_opts.index(target_sample.annotation_status) if target_sample.annotation_status in status_opts else 0
+                new_status = st.selectbox("Annotation Verification Status:", status_opts, index=curr_status_idx)
+
+            if st.button("💾 Save QA Pair Changes", type="primary"):
+                target_sample.question = new_q
+                target_sample.reference_answer = new_ans
+                target_sample.document_id = new_doc
+                target_sample.topic = new_topic
+                target_sample.difficulty = new_diff
+                target_sample.annotation_status = new_status
+                if selected_file:
+                    if selected_file.suffix.lower() == ".csv":
+                        export_dataset_to_csv(samples, selected_file)
+                    else:
+                        export_dataset_to_json(samples, selected_file)
+                st.success(f"Updated QA pair `{edit_sample_id}` and saved to `{selected_file.name if selected_file else 'disk'}`!")
+                st.rerun()
+
+    # Add New QA Pair Expander
+    with st.expander("➕ Add New Expert-Annotated QA Pair"):
+        a_col1, a_col2 = st.columns(2)
+        with a_col1:
+            add_q = st.text_area("Question:", placeholder="Enter scientific or technical question...", height=70)
+            add_doc = st.text_input("Source Document ID:", placeholder="e.g. doc_rerag_paper")
+            add_topic = st.text_input("Topic:", placeholder="e.g. architecture, verification")
+        with a_col2:
+            add_ans = st.text_area("Ideal Reference Answer:", placeholder="Enter ground truth reference answer...", height=70)
+            add_diff = st.selectbox("Difficulty Level:", ["easy", "medium", "hard"], index=1)
+            add_status = st.selectbox("Annotation Status:", ["verified_expert", "reviewed", "unverified_synthetic"], index=0)
+
+        if st.button("➕ Add to Dataset"):
+            if not add_q.strip() or not add_ans.strip():
+                st.error("Both Question and Reference Answer are required.")
+            else:
+                new_id = f"qa_{len(samples) + 1:03d}"
+                new_sample = EvaluationSample(
+                    sample_id=new_id,
+                    question=add_q.strip(),
+                    reference_answer=add_ans.strip(),
+                    document_id=add_doc.strip() or None,
+                    topic=add_topic.strip() or "general",
+                    difficulty=add_diff,
+                    annotation_status=add_status,
+                )
+                samples.append(new_sample)
+                if selected_file:
+                    if selected_file.suffix.lower() == ".csv":
+                        export_dataset_to_csv(samples, selected_file)
+                    else:
+                        export_dataset_to_json(samples, selected_file)
+                st.success(f"Added new sample `{new_id}` to `{selected_file.name if selected_file else 'dataset'}`!")
+                st.rerun()
+
+    # Export active dataset buttons
+    st.markdown("##### 📥 Export Active Dataset")
+    ex_c1, ex_c2, _ = st.columns([1, 1, 2])
+    with ex_c1:
+        json_data = json.dumps([s.to_dict() for s in samples], indent=2)
+        st.download_button(
+            "⬇️ Download JSON",
+            data=json_data,
+            file_name=f"{st.session_state.active_dataset_name or 'dataset'}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    with ex_c2:
+        import io
+        import csv
+        csv_buf = io.StringIO()
+        fieldnames = ["sample_id", "question", "reference_answer", "document_id", "topic", "difficulty", "annotation_status"]
+        writer = csv.DictWriter(csv_buf, fieldnames=fieldnames)
+        writer.writeheader()
+        for s in samples:
+            writer.writerow({
+                "sample_id": s.sample_id,
+                "question": s.question,
+                "reference_answer": s.reference_answer,
+                "document_id": s.document_id or "",
+                "topic": s.topic or "",
+                "difficulty": s.difficulty or "",
+                "annotation_status": s.annotation_status or "verified_expert",
+            })
+        st.download_button(
+            "⬇️ Download CSV",
+            data=csv_buf.getvalue(),
+            file_name=f"{st.session_state.active_dataset_name or 'dataset'}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    # 4. Leakage-Resistant Dataset Splitting & Audit
+    st.markdown("---")
+    st.markdown("### 🛡️ Leakage-Resistant Dataset Partitioning & Leakage Audit")
+    st.caption(
+        "Prevent data contamination by isolating Optimization (Train), Validation (Tune), and Held-Out Test sets. "
+        "Guarantees that test answers are strictly quarantined from the optimizer."
+    )
+
+    sp_c1, sp_c2 = st.columns(2)
+    with sp_c1:
+        strategy = st.selectbox(
+            "Partitioning Strategy:",
+            options=[
+                "near_duplicate_grouped",
+                "document_level",
+                "stratified_topic",
+                "random_row",
+            ],
+            format_func=lambda s: {
+                "near_duplicate_grouped": "Near-Duplicate Grouped (Clusters overlapping queries together)",
+                "document_level": "Document-Level (Quarantines whole documents to single splits)",
+                "stratified_topic": "Topic-Stratified (Preserves topic distribution)",
+                "random_row": "Random Row Split (Baseline — potential query leakage)",
+            }.get(s, s),
+            help="Select the strategy to enforce isolation and prevent test data leakage.",
+        )
+        random_seed = st.number_input("Reproducibility Seed:", min_value=1, max_value=99999, value=42, step=1, key="split_seed")
+
+    with sp_c2:
+        train_pct = st.slider("Optimization (Train) %", min_value=10, max_value=80, value=50, step=5)
+        val_pct = st.slider("Validation %", min_value=10, max_value=50, value=25, step=5)
+        test_pct = max(0, 100 - (train_pct + val_pct))
+        st.info(f"Resulting Split: **Train {train_pct}%** | **Val {val_pct}%** | **Held-Out Test {test_pct}%**")
+
+    if st.button("🔬 Compute & Audit Split", type="primary"):
+        splits = split_train_val_test_leakage_resistant(
+            samples=samples,
+            strategy=strategy,
+            train_ratio=train_pct / 100.0,
+            val_ratio=val_pct / 100.0,
+            test_ratio=test_pct / 100.0,
+            random_seed=int(random_seed),
+        )
+        audit = audit_split_leakage(splits)
+        st.session_state.active_dataset_splits = splits
+        st.session_state.split_leakage_audit = audit
+
+    splits = st.session_state.get("active_dataset_splits")
+    audit = st.session_state.get("split_leakage_audit")
+
+    if splits and audit:
+        st.markdown("#### 📋 Partition Distribution & Leakage Audit Report")
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            st.metric("Optimization (Train)", len(splits.train_samples), help="Used exclusively during parameter search.")
+        with s2:
+            st.metric("Validation", len(splits.val_samples), help="Used for parameter selection and topic stability tuning.")
+        with s3:
+            st.metric("Held-Out Test", len(splits.test_samples), help="Strictly quarantined for uncorrupted final testing.")
+        with s4:
+            leak_status = "✅ CLEAN" if audit["is_leakage_free"] else "⚠️ LEAKAGE"
+            st.metric("Leakage Status", leak_status)
+
+        if audit["is_leakage_free"]:
+            st.success("✅ **Zero-Leakage Guarantee Verified:** No exact duplicates or near-duplicate query overlaps cross between splits.")
+        else:
+            st.warning("⚠️ **Leakage Detected Across Splits:**")
+            for w in audit.get("warnings", []):
+                st.markdown(f"- {w}")
+
+        if audit.get("near_duplicate_cross_split_pairs"):
+            with st.expander(f"⚠️ {len(audit['near_duplicate_cross_split_pairs'])} Cross-Split Near-Duplicate Pairs"):
+                for p in audit["near_duplicate_cross_split_pairs"]:
+                    st.markdown(f"- **{p['sample_a_id']}** ({p['split_a']}) vs **{p['sample_b_id']}** ({p['split_b']}): similarity = {p['similarity']:.2f}")
+
+        # Download splits
+        st.markdown("##### 📥 Export Partitioned Splits")
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.download_button(
+                "⬇️ Download Train Split JSON",
+                data=json.dumps([s.to_dict() for s in splits.train_samples], indent=2),
+                file_name="split_train_optimization.json",
+                mime="application/json",
+            )
+        with d2:
+            st.download_button(
+                "⬇️ Download Val Split JSON",
+                data=json.dumps([s.to_dict() for s in splits.val_samples], indent=2),
+                file_name="split_validation.json",
+                mime="application/json",
+            )
+        with d3:
+            st.download_button(
+                "⬇️ Download Test Split JSON",
+                data=json.dumps([s.to_dict() for s in splits.test_samples], indent=2),
+                file_name="split_held_out_test.json",
+                mime="application/json",
+            )
 
 
 # ==============================================================================
@@ -666,12 +1067,13 @@ def render_optimization_lab(settings: Settings) -> None:
     opt_mode = st.radio(
         "Optimization Strategy / Mode:",
         options=[
+            "Proposed Generalization-Aware ReRAG (Train on Train, Select on Val, Freeze for Test)",
             "Greedy Coordinate Search (Original ReRAG Baseline)",
             "Random Search (Stochastic Uniform Exploration)",
             "Simulated Annealing (Probabilistic Acceptance)",
-            "Controlled Multi-Method Comparison (All 4 Methods)",
+            "Controlled Multi-Method Comparison (Fixed vs Original ReRAG vs Proposed)",
         ],
-        index=3,
+        index=0,
         horizontal=True,
     )
 
@@ -713,7 +1115,17 @@ def render_optimization_lab(settings: Settings) -> None:
         st.markdown("##### Strategy-Specific Hyperparameters:")
         s_c1, s_c2 = st.columns(2)
         with s_c1:
-            if "Random" in opt_mode:
+            if "Generalization-Aware" in opt_mode:
+                gen_trials = st.number_input("Candidate Evaluation Budget", min_value=3, max_value=30, value=10, step=1)
+                stab_weight = st.slider("Stability Penalty (lambda)", min_value=0.0, max_value=0.5, value=0.10, step=0.02, help="Penalizes variance across topics.")
+                overfit_weight = st.slider("Overfit Penalty (beta)", min_value=0.0, max_value=0.3, value=0.05, step=0.01, help="Penalizes train-val score gap.")
+                max_iterations = 5
+                step_decay = 0.5
+                rs_trials = 8
+                sa_temp = 1.0
+                sa_cooling = 0.85
+                sa_iters = 8
+            elif "Random" in opt_mode:
                 rs_trials = st.number_input("Random Search Budget (Trials)", min_value=2, max_value=50, value=8, step=1)
                 max_iterations = 5
                 step_decay = 0.5
@@ -1011,7 +1423,22 @@ def render_results_and_comparison(settings: Settings) -> None:
         with c2:
             st.info(f"🎯 **Best Optimization (Train):** `{comp_res.best_train_method}`")
 
-        st.markdown("#### 📋 Comparative Performance Summary")
+        # Metric Classification & Transparency Legend
+        st.markdown(
+            """
+            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.8rem 1rem; margin-bottom: 1rem; font-size: 0.82rem;">
+                <span style="font-weight: 700; color: #1e293b;">🔬 Metric Classification & Scientific Transparency:</span><br>
+                <span style="background-color: #dcfce7; color: #15803d; padding: 2px 6px; border-radius: 4px; font-weight: 600;">Deterministic</span> Exact lexical/structural metrics (Token F1, Faithfulness, Coverage, Exact Match).<br>
+                <span style="background-color: #fef3c7; color: #b45309; padding: 2px 6px; border-radius: 4px; font-weight: 600;">Neural Proxy</span> Dense cosine similarity (SentenceTransformers). Evaluates topical alignment, <em>not</em> factual truth.<br>
+                <span style="background-color: #f3e8ff; color: #7e22ce; padding: 2px 6px; border-radius: 4px; font-weight: 600;">LLM Judge</span> Heuristic model-based consistency checking.<br>
+                <span style="background-color: #f1f5f9; color: #475569; padding: 2px 6px; border-radius: 4px; font-weight: 600;">System</span> End-to-end latency, number of trials, and computational indexing cost proxy.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("#### 📋 Controlled Multi-Method Comparison Table")
+        st.caption("Controlled evaluation across identical corpus and held-out test split. Optimizers never accessed test answers during search.")
         render_multi_method_comparison_table(comp_res.summary_records)
 
         st.markdown("---")
@@ -1027,6 +1454,35 @@ def render_results_and_comparison(settings: Settings) -> None:
             "- **Multi-Metric Integrity:** Objective balances faithfulness, coverage, and similarity to prevent "
             "superficial semantic hallucination masking."
         )
+
+        # Export options
+        st.markdown("##### 📥 Export Study Results")
+        ex_r1, ex_r2 = st.columns(2)
+        with ex_r1:
+            json_str = json.dumps(comp_res.to_dict(), indent=2)
+            st.download_button(
+                "⬇️ Download Experiment JSON",
+                data=json_str,
+                file_name=f"{comp_res.experiment_id}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with ex_r2:
+            import io
+            import csv
+            buf = io.StringIO()
+            if comp_res.summary_records:
+                writer = csv.DictWriter(buf, fieldnames=list(comp_res.summary_records[0].keys()))
+                writer.writeheader()
+                for r in comp_res.summary_records:
+                    writer.writerow(r)
+            st.download_button(
+                "⬇️ Download Summary CSV",
+                data=buf.getvalue(),
+                file_name=f"{comp_res.experiment_id}_summary.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
     # 2. Single Optimizer Inspection View
     elif single_res is not None:
@@ -1243,6 +1699,7 @@ def render_dashboard() -> None:
             "Navigate to Section:",
             options=[
                 "📁 Document Workspace",
+                "📚 QA Dataset Lab",
                 "💬 RAG Chat",
                 "🧪 Optimization Lab",
                 "📊 Results and Comparison",
@@ -1255,6 +1712,8 @@ def render_dashboard() -> None:
     # Route navigation
     if nav_selection == "📁 Document Workspace":
         render_document_workspace(settings)
+    elif nav_selection == "📚 QA Dataset Lab":
+        render_qa_dataset_lab(settings)
     elif nav_selection == "💬 RAG Chat":
         render_rag_chat(settings)
     elif nav_selection == "🧪 Optimization Lab":

@@ -89,6 +89,7 @@ def test_comparison_runner_execution(test_setup):
     obj = OptimizationObjective()
 
     comp_result = runner.run(
+        methods=("fixed", "greedy", "random", "simulated_annealing"),
         baseline_config=ChunkConfig(200, 50),
         bounds=bounds,
         objective=obj,

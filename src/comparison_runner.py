@@ -401,7 +401,7 @@ class ComparisonRunner:
         bounds: Optional[SearchBounds] = None,
         search_bounds: Optional[SearchBounds] = None,
         objective: Optional[OptimizationObjective] = None,
-        methods: Sequence[str] = ("fixed", "greedy", "random", "simulated_annealing"),
+        methods: Sequence[str] = ("fixed", "greedy", "generalization_aware"),
         matched_budget: int = 10,
         save_results: bool = True,
         experiment_name: Optional[str] = None,
@@ -423,7 +423,7 @@ class ComparisonRunner:
 
     def run_comparison(
         self,
-        methods: Sequence[str] = ("fixed", "greedy", "random", "simulated_annealing"),
+        methods: Sequence[str] = ("fixed", "greedy", "generalization_aware"),
         matched_budget: int = 10,
         baseline_config: Optional[ChunkConfig] = None,
         search_bounds: Optional[SearchBounds] = None,
@@ -690,6 +690,66 @@ class ComparisonRunner:
                         "cost_proxy": round(0.01 * exec_time + 0.005 * sa_res.total_trials, 4),
                     },
                     metadata={"strategy": "simulated_annealing"},
+                )
+
+            elif m_key in ("generalization_aware", "gen_aware", "proposed", "adaptive_generalization"):
+                display_name = "Proposed Generalization-Aware ReRAG"
+                t0 = time.perf_counter()
+
+                opt_gen = ChunkOptimizerFactory.create(
+                    strategy="generalization_aware",
+                    baseline_config=base_cfg,
+                    search_bounds=bounds,
+                    objective=obj,
+                    random_seed=self.random_seed,
+                    max_trials=matched_budget,
+                    documents=self.documents,
+                    pipeline=self.pipeline,
+                    evaluator=self.evaluator,
+                    optimization_samples=self.train_samples,
+                    validation_samples=self.val_samples,
+                    collection_name=self.collection_name,
+                    dataset_id=f"train_n{len(self.train_samples)}_val_n{len(self.val_samples)}",
+                    evaluation_cache=self.evaluation_cache,
+                )
+
+                gen_res = opt_gen.optimize()
+                exec_time = time.perf_counter() - t0
+
+                # Post-selection held-out test evaluation (Strict zero-leakage guarantee)
+                test_metrics, test_score = self._evaluate_config_on_samples(gen_res.selected_config, self.test_samples, obj)
+                val_metrics, val_score = (None, None)
+                if self.val_samples:
+                    val_metrics, val_score = self._evaluate_config_on_samples(gen_res.selected_config, self.val_samples, obj)
+
+                gen_gap = round(test_score - gen_res.selected_score, 4)
+
+                method_results["generalization_aware"] = ComparisonMethodResult(
+                    method_id="generalization_aware",
+                    display_name=display_name,
+                    selected_config=gen_res.selected_config,
+                    baseline_config=base_cfg,
+                    train_score=gen_res.selected_score,
+                    train_metrics=gen_res.selected_metrics,
+                    validation_score=val_score,
+                    validation_metrics=val_metrics,
+                    test_score=test_score,
+                    test_metrics=test_metrics,
+                    generalization_gap=gen_gap,
+                    total_trials=gen_res.total_trials,
+                    accepted_trials=gen_res.accepted_trials,
+                    execution_time_seconds=exec_time,
+                    stopping_reason=gen_res.stopping_reason,
+                    candidate_history=gen_res.candidate_history,
+                    cost_metrics={
+                        "chunks_indexed": gen_res.total_trials * len(self.documents),
+                        "llm_calls": gen_res.total_trials * len(self.train_samples) + (len(self.val_samples) * 3 if self.val_samples else 0),
+                        "cost_proxy": round(0.01 * exec_time + 0.005 * gen_res.total_trials, 4),
+                    },
+                    metadata={
+                        "strategy": "generalization_aware",
+                        "stability_selection": gen_res.metadata.get("stability_selection", {}),
+                    },
                 )
 
             if progress_callback:

@@ -1815,6 +1815,462 @@ class RandomSearchOptimizer:
         )
 
 
+# ==============================================================================
+# APPROACH 1: FIXED CONFIGURATION RAG (BASELINE)
+# ==============================================================================
+
+
+class FixedConfigOptimizer:
+    """Fixed-Configuration RAG (Approach 1): evaluates user-defined fixed chunking parameters without search."""
+
+    def __init__(
+        self,
+        baseline_config: Optional[ChunkConfig] = None,
+        evaluate_fn: Optional[Callable[[ChunkConfig], Union[EvaluationReport, Dict[str, Any], float]]] = None,
+        documents: Optional[Sequence[LoadedDocument]] = None,
+        pipeline: Optional[RAGPipeline] = None,
+        evaluator: Optional[Evaluator] = None,
+        optimization_samples: Optional[Sequence[EvaluationSample]] = None,
+        collection_name: Optional[str] = None,
+        dataset_id: str = "expert_qa_dataset",
+        evaluation_cache: Optional[Dict[Tuple[int, int], Tuple[Dict[str, Any], float]]] = None,
+        objective: Optional[OptimizationObjective] = None,
+        **kwargs: Any,
+    ) -> None:
+        self.config = baseline_config or ChunkConfig(500, 50)
+        self.dataset_id = dataset_id
+        self.collection_name = collection_name or "fixed_rag_collection"
+        self.evaluation_cache = evaluation_cache
+        self.objective = objective or OptimizationObjective()
+
+        if evaluate_fn is not None:
+            self._evaluate_fn = evaluate_fn
+        elif documents is not None and pipeline is not None and evaluator is not None and optimization_samples is not None:
+            def _eval_config(cfg: ChunkConfig) -> EvaluationReport:
+                chunker = TextChunker(chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap)
+                pipeline.index_documents(documents=documents, chunker=chunker, collection_name=self.collection_name)
+                return evaluator.evaluate(
+                    samples=optimization_samples,
+                    deterministic=True,
+                    config_override=cfg.to_dict(),
+                    collection_name=self.collection_name,
+                )
+            self._evaluate_fn = _eval_config
+        else:
+            raise ValueError("FixedConfigOptimizer requires evaluate_fn or (documents, pipeline, evaluator, optimization_samples).")
+
+    def run(self, **kwargs: Any) -> OptimizationResult:
+        return self.optimize(**kwargs)
+
+    def optimize(self, **kwargs: Any) -> OptimizationResult:
+        t0 = time.perf_counter()
+        raw = self._evaluate_fn(self.config)
+        metrics = raw.aggregate_metrics if hasattr(raw, "aggregate_metrics") else (raw if isinstance(raw, dict) else {})
+        score = self.objective.calculate_score(metrics) if isinstance(metrics, dict) else float(raw)
+        exec_time = time.perf_counter() - t0
+
+        trial = CandidateTrial(
+            trial_id=1,
+            iteration=1,
+            config=self.config,
+            step_size=0,
+            metrics=metrics if isinstance(metrics, dict) else {},
+            objective_score=score,
+            status="baseline",
+            decision_reason="Static fixed baseline configuration (no optimization search performed)",
+            execution_time_seconds=exec_time,
+        )
+
+        return OptimizationResult(
+            baseline_config=self.config,
+            baseline_metrics=metrics if isinstance(metrics, dict) else {},
+            baseline_score=score,
+            selected_config=self.config,
+            selected_metrics=metrics if isinstance(metrics, dict) else {},
+            selected_score=score,
+            improvement=0.0,
+            candidate_history=[trial],
+            stopping_reason="Static fixed baseline evaluation (no search performed)",
+            total_iterations=1,
+            total_trials=1,
+            accepted_trials=1,
+            total_execution_time_seconds=exec_time,
+            optimization_dataset_id=self.dataset_id,
+            metadata={"strategy": "fixed_configuration"},
+        )
+
+
+# ==============================================================================
+# APPROACH 3: GENERALIZATION-AWARE RERAG (PROPOSED METHOD)
+# ==============================================================================
+
+
+@dataclass
+class GeneralizationAwareConfig:
+    """Hyperparameters governing Generalization-Aware Chunk Optimization."""
+
+    initial_chunk_size: int = 500
+    initial_chunk_overlap: int = 50
+    bounds: SearchBounds = field(default_factory=SearchBounds)
+    objective: OptimizationObjective = field(default_factory=OptimizationObjective)
+    max_trials: int = 12
+    step_size: int = 100
+    overlap_step: int = 25
+    stability_penalty_weight: float = 0.20  # lambda: weight for cross-topic variance penalty
+    overfit_penalty_weight: float = 0.15    # beta: weight for train-val generalization gap penalty
+    top_k_candidates: int = 3
+    random_seed: int = 42
+
+
+class GeneralizationAwareOptimizer:
+    """Generalization-Aware ReRAG (Approach 3): Adaptive Chunk Optimization Using
+
+    Expanded Datasets and Leakage-Resistant Intermediate Validation.
+
+    Key Scientific Guarantees:
+    1. Candidate Exploration: Generates and evaluates candidate chunk configurations
+       using ONLY the optimization (training) query set.
+    2. Validation Selection: Validates top candidate configurations on an independent
+       intermediate validation query set without consulting held-out test answers.
+    3. Generalization Stability Objective: Selects configuration maximizing:
+       J_gen = Score_val - lambda * sigma_topics - beta * max(0, Score_opt - Score_val)
+       favoring configurations that generalize consistently across diverse topics.
+    4. Post-Selection Freezing: Freezes selected parameters before final held-out test evaluation.
+    """
+
+    def __init__(
+        self,
+        baseline_config: Optional[ChunkConfig] = None,
+        gen_config: Optional[GeneralizationAwareConfig] = None,
+        evaluate_fn: Optional[Callable[[ChunkConfig], Union[EvaluationReport, Dict[str, Any], float]]] = None,
+        evaluate_val_fn: Optional[Callable[[ChunkConfig], Union[EvaluationReport, Dict[str, Any], float]]] = None,
+        documents: Optional[Sequence[LoadedDocument]] = None,
+        pipeline: Optional[RAGPipeline] = None,
+        evaluator: Optional[Evaluator] = None,
+        optimization_samples: Optional[Sequence[EvaluationSample]] = None,
+        validation_samples: Optional[Sequence[EvaluationSample]] = None,
+        collection_name: Optional[str] = None,
+        dataset_id: str = "expert_qa_dataset",
+        evaluation_cache: Optional[Dict[Tuple[int, int], Tuple[Dict[str, Any], float]]] = None,
+        **kwargs: Any,
+    ) -> None:
+        self.config = gen_config or kwargs.get("config") or GeneralizationAwareConfig()
+        self.baseline_config = baseline_config or ChunkConfig(
+            self.config.initial_chunk_size,
+            self.config.initial_chunk_overlap,
+        )
+        self.dataset_id = dataset_id
+        self.collection_name = collection_name or "gen_aware_opt_collection"
+        self.evaluation_cache = evaluation_cache
+        self.val_cache: Dict[Tuple[int, int], Tuple[Dict[str, Any], float]] = {}
+
+        self.documents = list(documents or [])
+        self.pipeline = pipeline
+        self.evaluator = evaluator
+        self.optimization_samples = list(optimization_samples or [])
+        self.validation_samples = list(validation_samples or [])
+
+        # Optimization evaluation mechanism
+        if evaluate_fn is not None:
+            self._evaluate_opt_fn = evaluate_fn
+        elif evaluator is not None and optimization_samples is not None:
+            def _eval_opt(cfg: ChunkConfig) -> Any:
+                if pipeline is not None and documents:
+                    chunker = TextChunker(chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap)
+                    pipeline.index_documents(documents=documents, chunker=chunker, collection_name=self.collection_name)
+                return evaluator.evaluate(
+                    samples=optimization_samples,
+                    deterministic=True,
+                    config_override=cfg.to_dict(),
+                    collection_name=self.collection_name,
+                )
+            self._evaluate_opt_fn = _eval_opt
+        elif documents is not None and pipeline is not None and evaluator is not None and optimization_samples is not None:
+            def _eval_opt(cfg: ChunkConfig) -> Any:
+                chunker = TextChunker(chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap)
+                pipeline.index_documents(documents=documents, chunker=chunker, collection_name=self.collection_name)
+                return evaluator.evaluate(
+                    samples=optimization_samples,
+                    deterministic=True,
+                    config_override=cfg.to_dict(),
+                    collection_name=self.collection_name,
+                )
+            self._evaluate_opt_fn = _eval_opt
+        else:
+            raise ValueError("GeneralizationAwareOptimizer requires evaluate_fn or evaluator with optimization_samples.")
+
+        # Validation evaluation mechanism
+        if evaluate_val_fn is not None:
+            self._evaluate_val_fn = evaluate_val_fn
+        elif evaluator is not None and validation_samples:
+            def _eval_val(cfg: ChunkConfig) -> Any:
+                if pipeline is not None and documents:
+                    chunker = TextChunker(chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap)
+                    pipeline.index_documents(documents=documents, chunker=chunker, collection_name=self.collection_name)
+                return evaluator.evaluate(
+                    samples=validation_samples,
+                    deterministic=True,
+                    config_override=cfg.to_dict(),
+                    collection_name=self.collection_name,
+                )
+            self._evaluate_val_fn = _eval_val
+        elif documents is not None and pipeline is not None and evaluator is not None and validation_samples:
+            def _eval_val(cfg: ChunkConfig) -> Any:
+                chunker = TextChunker(chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap)
+                pipeline.index_documents(documents=documents, chunker=chunker, collection_name=self.collection_name)
+                return evaluator.evaluate(
+                    samples=validation_samples,
+                    deterministic=True,
+                    config_override=cfg.to_dict(),
+                    collection_name=self.collection_name,
+                )
+            self._evaluate_val_fn = _eval_val
+        else:
+            self._evaluate_val_fn = None
+
+        self.rng = random.Random(self.config.random_seed)
+
+    def _evaluate_candidate(
+        self,
+        cfg: ChunkConfig,
+        is_val: bool = False,
+    ) -> Tuple[Dict[str, Any], float]:
+        """Evaluate candidate on training or validation split with caching."""
+        cache_key = (cfg.chunk_size, cfg.chunk_overlap)
+        target_cache = self.val_cache if is_val else self.evaluation_cache
+
+        if target_cache is not None and cache_key in target_cache:
+            return target_cache[cache_key]
+
+        eval_fn = self._evaluate_val_fn if (is_val and self._evaluate_val_fn is not None) else self._evaluate_opt_fn
+        raw = eval_fn(cfg)
+
+        metrics = raw.aggregate_metrics if hasattr(raw, "aggregate_metrics") else (raw if isinstance(raw, dict) else {})
+        score = self.config.objective.calculate_score(metrics) if isinstance(metrics, dict) else float(raw)
+
+        if target_cache is not None:
+            target_cache[cache_key] = (metrics, score)
+
+        return metrics, score
+
+    def _compute_topic_stability(
+        self,
+        cfg: ChunkConfig,
+    ) -> Tuple[float, Dict[str, float]]:
+        """Compute standard deviation of scores across distinct question topics on validation set."""
+        if not self.validation_samples or not self.evaluator or not self.pipeline or not self.documents:
+            return 0.0, {}
+
+        # Group validation samples by topic
+        by_topic: Dict[str, List[EvaluationSample]] = {}
+        for s in self.validation_samples:
+            meta = getattr(s, "metadata", {}) or {}
+            top = meta.get("topic", "General") if isinstance(meta, dict) else "General"
+            by_topic.setdefault(top, []).append(s)
+
+        if len(by_topic) <= 1:
+            return 0.0, {}
+
+        topic_scores: Dict[str, float] = {}
+        # Evaluate each topic group
+        for topic_name, topic_samples in by_topic.items():
+            rep = self.evaluator.evaluate(
+                samples=topic_samples,
+                deterministic=True,
+                config_override=cfg.to_dict(),
+                collection_name=self.collection_name,
+            )
+            t_score = self.config.objective.calculate_score(rep.aggregate_metrics)
+            topic_scores[topic_name] = round(t_score, 4)
+
+        vals = list(topic_scores.values())
+        mean_v = sum(vals) / len(vals)
+        variance = sum((v - mean_v) ** 2 for v in vals) / len(vals)
+        std_v = math.sqrt(variance)
+
+        return round(std_v, 4), topic_scores
+
+    def run(self, **kwargs: Any) -> OptimizationResult:
+        return self.optimize(**kwargs)
+
+    def optimize(self, **kwargs: Any) -> OptimizationResult:
+        t0 = time.perf_counter()
+        bounds = self.config.bounds
+        trials: List[CandidateTrial] = []
+        trial_id = 0
+
+        # Phase 1: Evaluate Baseline on Optimization split
+        trial_id += 1
+        t_start = time.perf_counter()
+        base_metrics, base_score = self._evaluate_candidate(self.baseline_config, is_val=False)
+        t_dur = time.perf_counter() - t_start
+
+        baseline_trial = CandidateTrial(
+            trial_id=trial_id,
+            iteration=0,
+            config=self.baseline_config,
+            step_size=0,
+            metrics=base_metrics,
+            objective_score=base_score,
+            status="baseline",
+            decision_reason="Reference baseline configuration evaluated on optimization set",
+            execution_time_seconds=t_dur,
+        )
+        trials.append(baseline_trial)
+
+        # Generate candidates systematically around baseline and across bounds
+        candidates: List[ChunkConfig] = [self.baseline_config]
+        steps = [
+            (self.config.step_size, 0),
+            (-self.config.step_size, 0),
+            (0, self.config.overlap_step),
+            (0, -self.config.overlap_step),
+            (self.config.step_size * 2, 0),
+            (-self.config.step_size * 2, 0),
+            (self.config.step_size, self.config.overlap_step),
+            (-self.config.step_size, -self.config.overlap_step),
+            (self.config.step_size * 3, self.config.overlap_step * 2),
+        ]
+
+        for d_sz, d_ov in steps:
+            if len(candidates) >= self.config.max_trials:
+                break
+            new_sz = self.baseline_config.chunk_size + d_sz
+            new_ov = self.baseline_config.chunk_overlap + d_ov
+            # Validate bounds
+            if bounds.min_chunk_size <= new_sz <= bounds.max_chunk_size:
+                if bounds.min_chunk_overlap <= new_ov <= bounds.max_chunk_overlap:
+                    if new_ov < new_sz:
+                        cand = ChunkConfig(new_sz, new_ov)
+                        if cand not in candidates:
+                            candidates.append(cand)
+
+        # Fill remaining budget with randomized grid perturbation within bounds
+        while len(candidates) < self.config.max_trials:
+            r_sz = self.rng.randint(bounds.min_chunk_size // 25, bounds.max_chunk_size // 25) * 25
+            max_ov = min(bounds.max_chunk_overlap, r_sz - 25)
+            r_ov = self.rng.randint(bounds.min_chunk_overlap // 25, max(0, max_ov // 25)) * 25
+            cand = ChunkConfig(r_sz, r_ov)
+            if cand not in candidates:
+                candidates.append(cand)
+
+        # Phase 2: Evaluate All Candidates on Optimization Split
+        evaluated_candidates: List[Tuple[ChunkConfig, float, Dict[str, Any]]] = [
+            (self.baseline_config, base_score, base_metrics)
+        ]
+
+        for cand in candidates[1:]:
+            trial_id += 1
+            t_cand_start = time.perf_counter()
+            try:
+                metrics, score = self._evaluate_candidate(cand, is_val=False)
+                c_dur = time.perf_counter() - t_cand_start
+                evaluated_candidates.append((cand, score, metrics))
+
+                status = "accepted" if score >= base_score else "rejected"
+                reason = f"Optimization score: {score:.4f} (baseline: {base_score:.4f})"
+                trials.append(
+                    CandidateTrial(
+                        trial_id=trial_id,
+                        iteration=trial_id,
+                        config=cand,
+                        step_size=self.config.step_size,
+                        metrics=metrics,
+                        objective_score=score,
+                        status=status,
+                        decision_reason=reason,
+                        execution_time_seconds=c_dur,
+                    )
+                )
+            except Exception as exc:
+                c_dur = time.perf_counter() - t_cand_start
+                trials.append(
+                    CandidateTrial(
+                        trial_id=trial_id,
+                        iteration=trial_id,
+                        config=cand,
+                        step_size=self.config.step_size,
+                        metrics={},
+                        objective_score=None,
+                        status="failed",
+                        decision_reason=f"Evaluation error: {exc}",
+                        execution_time_seconds=c_dur,
+                    )
+                )
+
+        # Phase 3: Validation Selection & Generalization Stability Tuning
+        # Select among top candidates using validation queries + stability penalty
+        top_candidates = sorted(evaluated_candidates, key=lambda x: x[1], reverse=True)[:min(5, len(evaluated_candidates))]
+
+        best_cand = self.baseline_config
+        best_cand_metrics = base_metrics
+        best_cand_opt_score = base_score
+        best_gen_score = -1.0
+        best_stability_info: Dict[str, Any] = {}
+
+        for cand, opt_score, opt_metrics in top_candidates:
+            if self._evaluate_val_fn is not None:
+                val_metrics, val_score = self._evaluate_candidate(cand, is_val=True)
+                topic_std, topic_scores = self._compute_topic_stability(cand)
+
+                # Generalization Stability Criterion:
+                # J_gen = val_score - lambda * topic_std - beta * max(0, opt_score - val_score)
+                overfit_gap = max(0.0, opt_score - val_score)
+                stability_penalty = self.config.stability_penalty_weight * topic_std
+                overfit_penalty = self.config.overfit_penalty_weight * overfit_gap
+                gen_score = val_score - stability_penalty - overfit_penalty
+            else:
+                val_metrics, val_score = opt_metrics, opt_score
+                topic_std, topic_scores = 0.0, {}
+                gen_score = opt_score
+
+            if gen_score > best_gen_score:
+                best_gen_score = gen_score
+                best_cand = cand
+                best_cand_metrics = opt_metrics
+                best_cand_opt_score = opt_score
+                best_stability_info = {
+                    "val_score": round(val_score, 4),
+                    "topic_std": topic_std,
+                    "topic_scores": topic_scores,
+                    "gen_score": round(gen_score, 4),
+                }
+
+        total_exec_time = time.perf_counter() - t0
+        improvement = best_cand_opt_score - base_score
+
+        logger.info(
+            "GeneralizationAwareOptimizer selected frozen config: %s (Opt: %.4f | Val GenScore: %.4f) in %.2fs",
+            best_cand,
+            best_cand_opt_score,
+            best_gen_score,
+            total_exec_time,
+        )
+
+        return OptimizationResult(
+            baseline_config=self.baseline_config,
+            baseline_metrics=base_metrics,
+            baseline_score=base_score,
+            selected_config=best_cand,
+            selected_metrics=best_cand_metrics,
+            selected_score=best_cand_opt_score,
+            improvement=round(improvement, 4),
+            candidate_history=trials,
+            stopping_reason="Generalization stability selection complete (validation-frozen)",
+            total_iterations=len(evaluated_candidates),
+            total_trials=len(trials),
+            accepted_trials=sum(1 for t in trials if t.status == "accepted"),
+            total_execution_time_seconds=total_exec_time,
+            optimization_dataset_id=self.dataset_id,
+            metadata={
+                "strategy": "generalization_aware",
+                "stability_selection": best_stability_info,
+                "stability_penalty_weight": self.config.stability_penalty_weight,
+                "overfit_penalty_weight": self.config.overfit_penalty_weight,
+            },
+        )
+
+
 class ChunkOptimizerFactory:
     """Factory creating configured chunk optimizers by strategy name."""
 
@@ -1827,21 +2283,61 @@ class ChunkOptimizerFactory:
         random_seed: int = 42,
         max_trials: int = 15,
         evaluate_fn: Optional[Callable[[ChunkConfig], Union[EvaluationReport, Dict[str, Any], float]]] = None,
+        evaluate_val_fn: Optional[Callable[[ChunkConfig], Union[EvaluationReport, Dict[str, Any], float]]] = None,
         documents: Optional[Sequence[LoadedDocument]] = None,
         pipeline: Optional[RAGPipeline] = None,
         evaluator: Optional[Evaluator] = None,
         optimization_samples: Optional[Sequence[EvaluationSample]] = None,
+        validation_samples: Optional[Sequence[EvaluationSample]] = None,
         collection_name: Optional[str] = None,
         dataset_id: str = "synthetic_demonstration_dataset",
         evaluation_cache: Optional[Dict[Tuple[int, int], Tuple[Dict[str, Any], float]]] = None,
         **kwargs: Any,
-    ) -> Union[AdaptiveChunkOptimizer, RandomSearchOptimizer, SimulatedAnnealingOptimizer]:
+    ) -> Any:
         """Instantiate optimizer for the requested strategy."""
         strat = strategy.lower().strip()
         bounds = search_bounds or SearchBounds()
         obj = objective or OptimizationObjective()
 
-        if strat in ("greedy", "adaptive", "coordinate", "original"):
+        if strat in ("fixed", "baseline", "fixed_rag", "fixed_configuration"):
+            return FixedConfigOptimizer(
+                baseline_config=baseline_config,
+                evaluate_fn=evaluate_fn,
+                documents=documents,
+                pipeline=pipeline,
+                evaluator=evaluator,
+                optimization_samples=optimization_samples,
+                collection_name=collection_name,
+                dataset_id=dataset_id,
+                evaluation_cache=evaluation_cache,
+                objective=obj,
+                **kwargs,
+            )
+        elif strat in ("generalization_aware", "gen_aware", "proposed", "adaptive_generalization"):
+            g_cfg = GeneralizationAwareConfig(
+                bounds=bounds,
+                objective=obj,
+                random_seed=random_seed,
+                max_trials=max_trials,
+                stability_penalty_weight=kwargs.get("stability_penalty_weight", 0.20),
+                overfit_penalty_weight=kwargs.get("overfit_penalty_weight", 0.15),
+            )
+            return GeneralizationAwareOptimizer(
+                baseline_config=baseline_config,
+                gen_config=g_cfg,
+                evaluate_fn=evaluate_fn,
+                evaluate_val_fn=evaluate_val_fn,
+                documents=documents,
+                pipeline=pipeline,
+                evaluator=evaluator,
+                optimization_samples=optimization_samples,
+                validation_samples=validation_samples,
+                collection_name=collection_name,
+                dataset_id=dataset_id,
+                evaluation_cache=evaluation_cache,
+                **kwargs,
+            )
+        elif strat in ("greedy", "adaptive", "coordinate", "original", "original_rerag"):
             cfg = AdaptiveSearchConfig(
                 bounds=bounds,
                 objective=obj,
@@ -1911,7 +2407,7 @@ class ChunkOptimizerFactory:
             )
         else:
             raise ValueError(
-                f"Unknown optimization strategy: '{strategy}'. Supported strategies: 'greedy', 'random', 'simulated_annealing'"
+                f"Unknown optimization strategy: '{strategy}'. Supported strategies: 'fixed', 'original_rerag', 'generalization_aware', 'random', 'simulated_annealing'"
             )
 
 
