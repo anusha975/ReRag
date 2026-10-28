@@ -298,8 +298,10 @@ class DatasetValidator:
         unreviewed_count = 0
         reviewed_count = 0
 
-        # Load if path provided
-        if isinstance(samples_or_path, (Path, str)):
+        # Load if path provided or unwrap tuple
+        if isinstance(samples_or_path, tuple) and len(samples_or_path) == 2 and isinstance(samples_or_path[0], (list, tuple)):
+            samples = list(samples_or_path[0])
+        elif isinstance(samples_or_path, (Path, str)):
             p = Path(samples_or_path)
             if p.suffix.lower() == ".csv":
                 samples = load_dataset_from_csv(p)
@@ -434,6 +436,9 @@ def compute_dataset_statistics(
     available_document_ids: Optional[Set[str]] = None,
 ) -> DatasetStatistics:
     """Compute high-level statistical summary for a QA dataset."""
+    if isinstance(samples_or_path, tuple) and len(samples_or_path) == 2 and isinstance(samples_or_path[0], (list, tuple)):
+        samples_or_path = samples_or_path[0]
+
     val = DatasetValidator.validate_dataset(samples_or_path, available_document_ids=available_document_ids)
 
     # Count samples missing supporting passages

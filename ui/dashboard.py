@@ -508,12 +508,17 @@ def render_qa_dataset_lab(settings: Settings) -> None:
             if selected_file.suffix.lower() == ".csv":
                 samples = load_dataset_from_csv(selected_file)
             else:
-                samples = load_dataset_from_json(selected_file)
+                raw_loaded = load_dataset_from_json(selected_file)
+                samples = raw_loaded[0] if isinstance(raw_loaded, tuple) else raw_loaded
             st.session_state.active_dataset_samples = samples
             st.session_state.active_dataset_name = selected_file.name
         except Exception as exc:
             st.error(f"Failed to load dataset `{selected_file.name}`: {exc}")
             return
+
+    # Unwrap if session state previously stored a tuple
+    if isinstance(st.session_state.active_dataset_samples, tuple) and len(st.session_state.active_dataset_samples) > 0:
+        st.session_state.active_dataset_samples = st.session_state.active_dataset_samples[0]
 
     samples = st.session_state.active_dataset_samples
     if not samples:
@@ -562,30 +567,31 @@ def render_qa_dataset_lab(settings: Settings) -> None:
     with f4:
         search_query = st.text_input("Search Question:", placeholder="Filter by question keyword...")
 
-    filtered_samples = samples
+    filtered_samples = [s for s in samples if hasattr(s, "sample_id")]
     if filter_topic != "All":
-        filtered_samples = [s for s in filtered_samples if s.topic == filter_topic]
+        filtered_samples = [s for s in filtered_samples if getattr(s, "topic", None) == filter_topic]
     if filter_diff != "All":
-        filtered_samples = [s for s in filtered_samples if s.difficulty == filter_diff]
+        filtered_samples = [s for s in filtered_samples if getattr(s, "difficulty", None) == filter_diff]
     if filter_status != "All":
-        filtered_samples = [s for s in filtered_samples if s.annotation_status == filter_status]
+        filtered_samples = [s for s in filtered_samples if getattr(s, "annotation_status", None) == filter_status]
     if search_query.strip():
         q_lower = search_query.strip().lower()
-        filtered_samples = [s for s in filtered_samples if q_lower in s.question.lower()]
+        filtered_samples = [s for s in filtered_samples if q_lower in getattr(s, "question", "").lower()]
 
     st.caption(f"Showing {len(filtered_samples)} of {len(samples)} QA pairs:")
 
     # Table preview
     preview_rows = []
     for s in filtered_samples:
+        ans_text = getattr(s, "reference_answer", "") or ""
         preview_rows.append({
-            "Sample ID": s.sample_id,
-            "Question": s.question,
-            "Reference Answer": s.reference_answer[:80] + ("..." if len(s.reference_answer) > 80 else ""),
-            "Document ID": s.document_id or "—",
-            "Topic": s.topic or "—",
-            "Difficulty": s.difficulty or "—",
-            "Annotation Status": s.annotation_status,
+            "Sample ID": getattr(s, "sample_id", "—"),
+            "Question": getattr(s, "question", "—"),
+            "Reference Answer": ans_text[:80] + ("..." if len(ans_text) > 80 else ""),
+            "Document ID": getattr(s, "document_id", None) or "—",
+            "Topic": getattr(s, "topic", None) or "—",
+            "Difficulty": getattr(s, "difficulty", None) or "—",
+            "Annotation Status": getattr(s, "annotation_status", "verified_expert"),
         })
     st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
 
